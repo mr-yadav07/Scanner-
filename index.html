@@ -20,18 +20,24 @@
   video {
     max-height: 70vh;
   }
+  #faceCount {
+    margin-top: 1em;
+    font-size: 1.5em;
+  }
 </style>
 </head>
 <body>
   <video id="video" autoplay playsinline></video>
-  <canvas id="canvas" style="display:none;"></canvas>
+  <canvas id="overlay"></canvas>
+  <div id="faceCount">Faces detected: 0</div>
   <audio id="alarm" src="https://actions.google.com/sounds/v1/alarms/alarm_clock.ogg"></audio>
 <script type="module">
 import * as faceapi from 'https://cdn.jsdelivr.net/npm/face-api.js@0.22.2/+esm';
 (async function(){
   const video = document.getElementById('video');
-  const canvas = document.getElementById('canvas');
+  const overlay = document.getElementById('overlay');
   const alarm = document.getElementById('alarm');
+  const faceCount = document.getElementById('faceCount');
   try {
     const stream = await navigator.mediaDevices.getUserMedia({video: {facingMode: 'user'}});
     video.srcObject = stream;
@@ -40,25 +46,9 @@ import * as faceapi from 'https://cdn.jsdelivr.net/npm/face-api.js@0.22.2/+esm';
     return;
   }
   await faceapi.nets.tinyFaceDetector.loadFromUri('https://cdn.jsdelivr.net/npm/face-api.js@0.22.2/weights');
-  const options = new faceapi.TinyFaceDetectorOptions();
-  let alarmPlaying = false;
-  function detect(){
-    faceapi.detectAllFaces(video, options).then(detections=>{
-      if(detections.length>0){
-        if(!alarmPlaying){
-          alarm.play();
-          alarmPlaying = true;
-        }
-      } else {
-        alarm.pause();
-        alarm.currentTime = 0;
-        alarmPlaying = false;
-      }
-      requestAnimationFrame(detect);
-    });
-  }
-  detect();
-})();
-</script>
+  await faceapi.nets.faceLandmark68Net.loadFromUri('https://cdn.jsdelivr.net/npm/face-api.js@0.22.2/weights');const options = new faceapi.TinyFaceDetectorOptions(); const ctx = overlay.getContext('2d'); let alarmPlaying = false;
+
+video.addEventListener('play', () => { overlay.width = video.videoWidth; overlay.height = video.videoHeight; function detect(){ faceapi.detectAllFaces(video, options).withFaceLandmarks().then(detections=>{ ctx.clearRect(0,0,overlay.width,overlay.height); faceapi.draw.drawDetections(overlay, detections); faceapi.draw.drawFaceLandmarks(overlay, detections); faceCount.textContent = Faces detected: ${detections.length}; if(detections.length>0){ if(!alarmPlaying){ alarm.play().catch(()=>{}); alarmPlaying = true; } } else { alarm.pause(); alarm.currentTime = 0; alarmPlaying = false; } requestAnimationFrame(detect); }); } detect(); }); })(); </script>
+
 </body>
 </html>
