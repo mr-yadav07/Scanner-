@@ -1,85 +1,179 @@
 <!doctype html>
+
 <html lang="en">
 <head>
 <meta charset="utf-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>Camera Capture</title>
+<meta name="viewport" content="width=device-width, initial-scale=1,viewport-fit=cover" />
+<title>Live QR & Barcode Scanner</title>
 <style>
-  body,html {
-    margin:0; padding:0; height:100%; display:flex; flex-direction:column;
-    align-items:center; justify-content:center; font-family: Arial,sans-serif;
-    background:#111; color:#eee;
-  }
-  video, canvas {
-    max-width: 100vw;
-    border-radius: 8px;
-    border: 3px solid #0f0;
-    background:#000;
-  }
-  video {
-    max-height: 60vh;
-  }
-  #captureBtn {
-    margin: 1em;
-    padding: 0.8em 1.5em;
-    font-size: 1.2em;
-    background: #4a90e2;
-    border: none;
-    border-radius: 8px;
-    color: white;
-    cursor: pointer;
-  }
-  #captureBtn:hover {
-    background: #357ABD;
-  }
-  #downloadLink {
-    margin-top: 1em;
-    color: #0f0;
-    text-decoration: none;
-    font-weight: bold;
-    display: none;
-  }
+  :root{--bg:#0b0b0b;--fg:#e9f0f7;--accent:#06c;--accent-2:#12c45b}
+  html,body{height:100%;margin:0;background:var(--bg);color:var(--fg);font-family:Inter, system-ui, Arial;}
+  .app{height:100vh;display:grid;grid-template-rows:1fr auto;align-items:stretch}
+  .viewer{position:relative;display:flex;align-items:center;justify-content:center;overflow:hidden}
+  video{width:100%;height:100%;object-fit:cover;transform-origin:center;}
+  canvas.overlay{position:absolute;inset:0;pointer-events:none}
+  .hud{position:absolute;left:12px;top:12px;background:rgba(0,0,0,0.45);backdrop-filter: blur(6px);padding:8px 10px;border-radius:8px;font-size:13px}
+  .popup{position:absolute;pointer-events:auto;min-width:160px;max-width:80vw;background:linear-gradient(180deg,rgba(20,20,20,0.95),rgba(10,10,10,0.95));color:var(--fg);padding:8px 10px;border-radius:8px;border:1px solid rgba(255,255,255,0.06);box-shadow:0 6px 18px rgba(0,0,0,0.6);font-size:14px}
+  .popup a{color:var(--accent);word-break:break-all;text-decoration:underline}
+  .controls{display:flex;gap:8px;padding:10px;align-items:center;justify-content:center;background:linear-gradient(0deg,rgba(255,255,255,0.02),transparent);}
+  .btn{padding:8px 12px;border-radius:8px;border:none;background:#161616;color:var(--fg);cursor:pointer}
+  .small{font-size:12px;padding:6px 8px}
+  .tag{background:rgba(255,255,255,0.04);padding:6px 10px;border-radius:999px;font-weight:600}
+  .status{font-size:13px}
+  .linkbtn{display:inline-block;margin-top:6px;padding:6px 8px;background:var(--accent-2);color:#05120b;border-radius:6px;text-decoration:none}
+  @media (min-width:900px){.hud{font-size:15px}}
 </style>
 </head>
 <body>
-  <video id="video" autoplay playsinline></video>
-  <button id="captureBtn">Capture Photo</button>
-  <a id="downloadLink" download="photo.png">Download Photo</a>
-  <canvas id="canvas" style="display:none;"></canvas>
+  <div class="app">
+    <div class="viewer" id="viewer">
+      <video id="video" autoplay playsinline></video>
+      <canvas id="overlay" class="overlay"></canvas>
+      <div class="hud" id="hud">Ready</div>
+    </div><div class="controls">
+  <div class="tag" id="lastData">No code detected</div>
+  <button class="btn small" id="toggleFacing">Rear</button>
+  <button class="btn small" id="toggleTorch">Torch</button>
+  <button class="btn small" id="copyBtn">Copy</button>
+  <div style="flex:1"></div>
+  <div class="status" id="perf">FPS: --</div>
+</div>
 
-<script>
+  </div><script>
 (async function(){
   const video = document.getElementById('video');
-  const canvas = document.getElementById('canvas');
-  const captureBtn = document.getElementById('captureBtn');
-  const downloadLink = document.getElementById('downloadLink');
+  const overlay = document.getElementById('overlay');
+  const viewer = document.getElementById('viewer');
+  const hud = document.getElementById('hud');
+  const lastData = document.getElementById('lastData');
+  const perf = document.getElementById('perf');
+  const toggleFacing = document.getElementById('toggleFacing');
+  const toggleTorch = document.getElementById('toggleTorch');
+  const copyBtn = document.getElementById('copyBtn');
 
-  try {
-    const stream = await navigator.mediaDevices.getUserMedia({video: {facingMode: "environment"}});
-    video.srcObject = stream;
-  } catch(e) {
-    alert('Camera access denied or not available.');
-    return;
+  let facingMode = 'environment';
+  let stream = null;
+  let detector = null;
+  let useNative = false;
+  let zxingReader = null;
+  let lastDetected = null;
+  let scanRequest = null;
+  let torchOn = false;
+
+  let lastTime = performance.now(); let frames = 0; let fps = 0;
+  function updatePerf(){ frames++; const now = performance.now(); if(now - lastTime > 1000){ fps = Math.round((frames*1000)/(now-lastTime)); frames = 0; lastTime = now; perf.textContent = 'FPS: '+fps; } scanRequest = requestAnimationFrame(updatePerf); }
+  updatePerf();
+
+  async function startCamera(){
+    stopCamera();
+    const constraints = { video: { facingMode, width: {ideal:1280}, height:{ideal:720} }, audio:false };
+    try{
+      stream = await navigator.mediaDevices.getUserMedia(constraints);
+      video.srcObject = stream;
+      await video.play();
+      resizeOverlay();
+      hud.textContent = 'Camera active';
+      await initDetector();
+      startScanLoop();
+    }catch(err){ console.error(err); hud.textContent = 'Camera access denied or not available'; }
   }
 
-  captureBtn.onclick = function(){
-    const width = video.videoWidth;
-    const height = video.videoHeight;
-    canvas.width = width;
-    canvas.height = height;
-    const ctx = canvas.getContext('2d');
-    ctx.drawImage(video, 0, 0, width, height);
-    canvas.toBlob(function(blob){
-      const url = URL.createObjectURL(blob);
-      downloadLink.href = url;
-      downloadLink.style.display = 'inline-block';
-      downloadLink.textContent = 'Download Photo';
-      downloadLink.onclick = () => {
-        setTimeout(() => URL.revokeObjectURL(url), 1000);
-      };
-    }, 'image/png');
-  };
+  function stopCamera(){
+    if(scanLoopRunning) stopScanLoop();
+    if(stream){ stream.getTracks().forEach(t=>t.stop()); stream = null; }
+    video.srcObject = null; hud.textContent = 'Stopped';
+  }
+
+  async function initDetector(){
+    if('BarcodeDetector' in window){
+      try{
+        const supported = await BarcodeDetector.getSupportedFormats();
+        detector = new BarcodeDetector({formats: supported});
+        useNative = true;
+        hud.textContent = 'Using native BarcodeDetector';
+        return;
+      }catch(e){ console.warn('native detector init failed', e); }
+    }
+    if(!zxingReader){
+      hud.textContent = 'Loading fallback decoder';
+      try{
+        await loadScript('https://unpkg.com/@zxing/library@0.18.6/umd/index.min.js');
+        if(window.ZXing && typeof window.ZXing.BrowserMultiFormatReader === 'function'){
+          zxingReader = new window.ZXing.BrowserMultiFormatReader();
+          hud.textContent = 'Using ZXing fallback';
+        } else {
+          hud.textContent = 'Decoder unavailable';
+        }
+      }catch(e){ console.warn('failed loading fallback', e); hud.textContent = 'Decoder unavailable'; }
+    }
+  }
+
+  function loadScript(src){ return new Promise((res,reject)=>{ const s = document.createElement('script'); s.src = src; s.onload = res; s.onerror = reject; document.head.appendChild(s); }); }
+
+  function resizeOverlay(){
+    const rect = video.getBoundingClientRect();
+    overlay.style.width = rect.width + 'px';
+    overlay.style.height = rect.height + 'px';
+    overlay.width = Math.max(1, Math.floor(rect.width));
+    overlay.height = Math.max(1, Math.floor(rect.height));
+  }
+
+  window.addEventListener('resize', resizeOverlay);
+  video.addEventListener('loadedmetadata', resizeOverlay);
+
+  function clearOverlay(){ const ctx = overlay.getContext('2d'); ctx.clearRect(0,0,overlay.width,overlay.height); }
+
+  function drawRectOnOverlay(box, label){ const ctx = overlay.getContext('2d'); clearOverlay(); if(!box) return; ctx.lineWidth = Math.max(2, overlay.width/320); ctx.strokeStyle = 'lime'; ctx.fillStyle = 'rgba(0,0,0,0.45)'; if(box.x !== undefined && box.width !== undefined){ ctx.strokeRect(box.x, box.y, box.width, box.height); ctx.fillRect(box.x, Math.max(0, box.y - 22), Math.min(overlay.width - box.x, 220), 20); ctx.fillStyle = 'lime'; ctx.font = '16px system-ui'; ctx.fillText(label || '', box.x + 6, Math.max(14, box.y - 6)); } else if(Array.isArray(box) && box.length){ ctx.beginPath(); ctx.moveTo(box[0].x, box[0].y); for(let i=1;i<box.length;i++) ctx.lineTo(box[i].x, box[i].y); ctx.closePath(); ctx.stroke(); } }
+
+  function cleanupPopup(){ const existing = document.getElementById('codePopup'); if(existing) existing.remove(); }
+
+  function showPopupFor(result){ cleanupPopup(); if(!result) return; const text = result.rawValue || result.text || result || ''; lastData.textContent = text.length>60? text.slice(0,57)+'...':text; lastDetected = {text, result}; const urlMatch = findURL(text); const popup = document.createElement('div'); popup.id = 'codePopup'; popup.className = 'popup'; let left = 12, top = 12; if(result.boundingBox){ const bb = result.boundingBox; left = bb.x + (bb.width/2) - 80; top = Math.max(8, bb.y - 60); } else if(result.cornerPoints && result.cornerPoints.length){ const pts = result.cornerPoints; const cx = pts.reduce((s,p)=>s+p.x,0)/pts.length; const cy = pts.reduce((s,p)=>s+p.y,0)/pts.length; left = cx - 80; top = cy - 60; } left = Math.max(8, Math.min(left, viewer.clientWidth - 180)); top = Math.max(8, Math.min(top, viewer.clientHeight - 60)); popup.style.left = left+'px'; popup.style.top = top+'px'; popup.innerHTML = '<strong>Detected</strong><div style="margin-top:6px;word-break:break-word;">'+escapeHtml(text)+'</div>'; if(urlMatch){ const a = document.createElement('a'); a.href = urlMatch; a.target = '_blank'; a.rel='noopener'; a.textContent = urlMatch; popup.appendChild(a); const open = document.createElement('a'); open.className='linkbtn'; open.textContent='Open Link'; open.href=urlMatch; open.target='_blank'; open.rel='noopener'; popup.appendChild(open); } viewer.appendChild(popup); }
+
+  function escapeHtml(s){ return String(s).replace(/[&<>"']/g, c=>({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"})[c]); }
+
+  function findURL(text){ if(!text) return null; const re = /(https?:\/\/[^\s]+)/i; const m = text.match(re); if(m) return m[0]; const re2 = /(^|\s)((www\.)[\w\-]+\.[\w\.\/\-\?&=%#]+)/i; const m2 = text.match(re2); if(m2) return 'https://'+m2[2]; return null; }
+
+  let scanLoopRunning = false;
+  let rafId = null;
+  function startScanLoop(){ if(scanLoopRunning) return; scanLoopRunning = true; scanFrame(); }
+  function stopScanLoop(){ scanLoopRunning = false; if(rafId) cancelAnimationFrame(rafId); rafId = null; }
+
+  async function scanFrame(){
+    if(!scanLoopRunning) return; if(!stream) return;
+    resizeOverlay(); clearOverlay(); try{
+      if(useNative && detector){
+        const results = await detector.detect(video);
+        if(results && results.length){ const r = results[0]; const mapped = mapBoundingBoxToOverlay(r.boundingBox || r.cornerPoints); drawRectOnOverlay(mapped, r.rawValue || r.displayValue || ''); showPopupFor(r); } else { cleanupPopup(); lastData.textContent='No code detected'; }
+      } else if(zxingReader){
+        const tmp = document.createElement('canvas'); tmp.width = overlay.width; tmp.height = overlay.height; const tctx = tmp.getContext('2d'); tctx.drawImage(video, 0, 0, overlay.width, overlay.height);
+        try{
+          let result = null;
+          if(typeof zxingReader.decodeFromCanvas === 'function'){
+            result = await zxingReader.decodeFromCanvas(tmp);
+          } else if(typeof zxingReader.decode === 'function'){
+            result = await zxingReader.decode(tmp);
+          }
+          if(result){ const text = result.text || (result.rawValue ? result.rawValue : ''); const points = (result.resultPoints || []).map(p=>({x:p.x, y:p.y})); drawRectOnOverlay(points.length? points : null, text); showPopupFor({rawValue:text, text, cornerPoints: points}); }
+          else { cleanupPopup(); lastData.textContent='No code detected'; }
+        }catch(e){ cleanupPopup(); lastData.textContent='No code detected'; }
+      } else { hud.textContent = 'No decoder available'; }
+    }catch(err){ console.warn(err); cleanupPopup(); lastData.textContent='No code detected'; }
+    rafId = requestAnimationFrame(scanFrame);
+  }
+
+  function mapBoundingBoxToOverlay(bb){ if(!bb) return null; if(bb.x !== undefined && bb.width !== undefined){ const videoRect = video.getBoundingClientRect(); const scaleX = overlay.width / videoRect.width; const scaleY = overlay.height / videoRect.height; return { x: Math.max(0, Math.floor(bb.x * scaleX)), y: Math.max(0, Math.floor(bb.y * scaleY)), width: Math.floor(bb.width * scaleX), height: Math.floor(bb.height * scaleY) }; } if(Array.isArray(bb)){
+    // assume points relative to displayed video
+    return bb.map(p=>({ x: p.x * (overlay.width/video.clientWidth || 1), y: p.y * (overlay.height/video.clientHeight || 1) })); }
+    return null;
+  }
+
+  async function setTorch(on){ if(!stream) return false; const track = stream.getVideoTracks()[0]; if(!track) return false; const capabilities = track.getCapabilities ? track.getCapabilities() : {}; if(!capabilities.torch) return false; try{ await track.applyConstraints({advanced:[{torch:on}]}); return true; }catch(e){ console.warn('Torch failed', e); return false; } }
+
+  toggleFacing.onclick = async ()=>{ facingMode = facingMode === 'environment' ? 'user' : 'environment'; toggleFacing.textContent = (facingMode === 'environment') ? 'Rear' : 'Front'; await startCamera(); };
+  toggleTorch.onclick = async ()=>{ torchOn = !torchOn; const ok = await setTorch(torchOn); if(ok) toggleTorch.textContent = torchOn? 'Torch On' : 'Torch'; else { torchOn = false; toggleTorch.textContent = 'Torch'; } };
+  copyBtn.onclick = async ()=>{ if(!lastDetected) return; try{ await navigator.clipboard.writeText(lastDetected.text); copyBtn.textContent='Copied'; setTimeout(()=>copyBtn.textContent='Copy',800); }catch(e){ copyBtn.textContent='Fail'; setTimeout(()=>copyBtn.textContent='Copy',800); } };
+
+  await startCamera();
 })();
-</script>
-</body>
-  </html>
+</script></body>
+    </html>
