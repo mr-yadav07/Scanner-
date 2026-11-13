@@ -98,7 +98,7 @@ jobs:
           BOARD_OPTIONS: ${{ matrix.options }}
         run: |
           mkdir -p /tmp/espforge-smoke
-          cat > /tmp/espforge-smoke/smoke.ino <<'EOF'
+          cat > /tmp/espforge-smoke/espforge-smoke.ino <<'EOF'
           #include <Arduino.h>
           void setup() { }
           void loop() { }
