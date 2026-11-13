@@ -336,6 +336,50 @@ private fun ForgeHome(activity: MainActivity) {
         }
         pendingZip = null
     }
+    val projectExportLauncher = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/zip")) { uri ->
+        if (uri != null) runCatching {
+            context.contentResolver.openOutputStream(uri)!!.use { stream ->
+                java.util.zip.ZipOutputStream(stream).use { zip ->
+                    projectFiles.forEach { (name, code) ->
+                        zip.putNextEntry(java.util.zip.ZipEntry(name))
+                        zip.write(code.toByteArray(Charsets.UTF_8))
+                        zip.closeEntry()
+                    }
+                    zip.putNextEntry(java.util.zip.ZipEntry("espforge-project.json"))
+                    zip.write(JSONObject().put("project", project).put("board", board.id).put("fqbn", fqbn).toString().toByteArray())
+                    zip.closeEntry()
+                }
+            }
+            output = "Project ZIP exported with ${projectFiles.size} source files."
+        }.onFailure { output = "Project export failed: ${it.message}" }
+    }
+    val projectImportLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri != null) runCatching {
+            val imported = linkedMapOf<String, String>()
+            context.contentResolver.openInputStream(uri)!!.use { stream ->
+                ZipInputStream(stream).use { zip ->
+                    var entry = zip.nextEntry
+                    while (entry != null) {
+                        if (!entry.isDirectory && entry.name != "espforge-project.json") {
+                            require(!entry.name.contains("/") && !entry.name.contains("\\\\") && !entry.name.startsWith(".")) {
+                                "Project ZIP must contain flat source files only."
+                            }
+                            if (entry.name.matches(Regex("[A-Za-z0-9_.-]{1,64}\\\\.(ino|cpp|c|h|hpp)"))) {
+                                imported[entry.name] = String(zip.readBytes(), Charsets.UTF_8)
+                            }
+                        }
+                        zip.closeEntry()
+                        entry = zip.nextEntry
+                    }
+                }
+            }
+            validateProjectFiles(imported)
+            saveFiles(imported)
+            activeFileName = "main.ino"
+            output = "Imported ${imported.size} source files."
+        }.onFailure { output = "Project import failed: ${it.message}" }
+    }
+
     val exportLibraryLauncher = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/zip")) { uri ->
         val file = pendingExport
         if (uri != null && file != null) runCatching {
@@ -408,6 +452,10 @@ private fun ForgeHome(activity: MainActivity) {
             }
             when (tab) {
                 "Editor" -> {
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        OutlinedButton(onClick = { projectImportLauncher.launch(arrayOf("application/zip", "application/x-zip-compressed")) }) { Text("Open project ZIP") }
+                        OutlinedButton(onClick = { projectExportLauncher.launch("${project}-project.zip") }) { Text("Export project") }
+                    }
                     Text("Project files · ${projectFiles.size}", style = MaterialTheme.typography.titleSmall)
                     Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                         projectFiles.keys.forEach { fileName ->
