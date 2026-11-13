@@ -3,7 +3,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from app.main import CompileRequest, CORE_BY_BOARD, DEFAULT_BOARD_OPTIONS, FQBN_BY_BOARD, auto_library_names
+from app.main import CompileRequest, CORE_BY_BOARD, DEFAULT_BOARD_OPTIONS, FQBN_BY_BOARD, app, auto_library_names
 
 
 def test_supported_board_presets_have_core_and_fqbn():
@@ -36,3 +36,9 @@ def test_library_auto_resolution_by_header():
     libraries = [{"name": "Fake NeoPixel", "providesIncludes": ["Adafruit_NeoPixel.h"]}]
     found = auto_library_names({"main.ino": "#include <Adafruit_NeoPixel.h>\nvoid setup(){}"}, libraries, [])
     assert found == ["Fake NeoPixel"]
+
+
+
+def test_streaming_compile_endpoint_is_registered():
+    paths = {route.path for route in app.routes}
+    assert "/v1/compile/stream" in paths
