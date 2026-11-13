@@ -9,6 +9,7 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Environment
 import android.provider.MediaStore
+import android.util.Base64
 import android.content.ContentValues
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -289,7 +290,20 @@ private fun ForgeHome(activity: MainActivity) {
     var board by remember { mutableStateOf(boards[2]) }
     var fqbn by remember { mutableStateOf(board.fqbn) }
     var mode by remember { mutableStateOf("Online") }
-    var source by remember { mutableStateOf("#include <Arduino.h>\n\nvoid setup() {\n  Serial.begin(115200);\n}\n\nvoid loop() {\n}\n") }
+    val defaultSource = "#include <Arduino.h>\n\nvoid setup() {\n  Serial.begin(115200);\n}\n\nvoid loop() {\n}\n"
+    var projectFiles by remember { mutableStateOf(loadProjectFiles(prefs, project, defaultSource)) }
+    var activeFileName by remember { mutableStateOf("main.ino") }
+    fun saveFiles(next: Map<String, String>) {
+        projectFiles = next
+        prefs.edit().putString("projectFiles:$project", JSONObject(next).toString()).apply()
+    }
+    fun addProjectFile(extension: String) {
+        val safeExtension = extension.removePrefix(".").lowercase()
+        val number = (1..99).firstOrNull { "File$it.$safeExtension" !in projectFiles } ?: return
+        val name = "File$number.$safeExtension"
+        saveFiles(projectFiles + (name to ""))
+        activeFileName = name
+    }
     var endpoint by remember { mutableStateOf(prefs.getString("endpoint", "") ?: "") }
     var apiKey by remember { mutableStateOf(prefs.getString("apiKey", "") ?: "") }
     var extraLibraries by remember { mutableStateOf("") }
@@ -394,14 +408,39 @@ private fun ForgeHome(activity: MainActivity) {
             }
             when (tab) {
                 "Editor" -> {
-                    OutlinedTextField(source, { source = it }, label = { Text("main.ino") }, minLines = 13, modifier = Modifier.fillMaxWidth())
+                    Text("Project files · ${projectFiles.size}", style = MaterialTheme.typography.titleSmall)
+                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        projectFiles.keys.forEach { fileName ->
+                            FilterChip(selected = activeFileName == fileName, onClick = { activeFileName = fileName }, label = { Text(fileName) })
+                        }
+                    }
+                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        OutlinedButton(onClick = { addProjectFile("h") }) { Text("+ .h") }
+                        OutlinedButton(onClick = { addProjectFile("cpp") }) { Text("+ .cpp") }
+                        OutlinedButton(onClick = { addProjectFile("c") }) { Text("+ .c") }
+                        OutlinedButton(onClick = { addProjectFile("ino") }) { Text("+ .ino") }
+                        TextButton(
+                            enabled = activeFileName != "main.ino" && activeFileName in projectFiles,
+                            onClick = {
+                                saveFiles(projectFiles - activeFileName)
+                                activeFileName = projectFiles.keys.firstOrNull { it != activeFileName } ?: "main.ino"
+                            }
+                        ) { Text("Delete") }
+                    }
+                    OutlinedTextField(
+                        projectFiles[activeFileName].orEmpty(),
+                        { edited -> saveFiles(projectFiles + (activeFileName to edited)) },
+                        label = { Text(activeFileName) },
+                        minLines = 15,
+                        modifier = Modifier.fillMaxWidth()
+                    )
                     OutlinedTextField(extraLibraries, { extraLibraries = it }, label = { Text("Additional library names (comma separated, optional)") }, minLines = 1, modifier = Modifier.fillMaxWidth())
                     Button(enabled = !busy, onClick = {
                         if (mode == "Online") {
                             busy = true; output = "Sending sketch to remote Arduino CLI compiler…"
                             scope.launch {
                                 val result = withContext(Dispatchers.IO) {
-                                    compileOnline(endpoint, apiKey, board.id, fqbn, project, source, extraLibraries)
+                                    compileOnline(endpoint, apiKey, board.id, fqbn, project, projectFiles, extraLibraries)
                                 }
                                 busy = false
                                 result.onSuccess { bytes ->
@@ -413,7 +452,7 @@ private fun ForgeHome(activity: MainActivity) {
                         } else {
                             busy = true
                             output = "Starting local Arduino CLI build in Termux. The first build needs the selected board core already installed."
-                            val success = runOfflineCompile(activity, board, fqbn, project, source)
+                            val success = runOfflineCompile(activity, board, fqbn, project, projectFiles)
                             busy = false
                             output = if (success) "Offline compile command sent to Termux. Check its build output; firmware is written to Documents/ESPForge/Builds/$project." else "Could not start Termux. Install Termux, allow external apps, grant Run commands permission and run the offline setup first."
                         }
@@ -532,6 +571,28 @@ private fun ForgeHome(activity: MainActivity) {
     }
 }
 
+private fun validateProjectFiles(files: Map<String, String>) {
+    require(files.isNotEmpty() && files.size <= 40) { "A project must contain 1–40 source files." }
+    require(files.containsKey("main.ino")) { "The project needs main.ino." }
+    require(files.keys.all { it.matches(Regex("[A-Za-z0-9_.-]{1,64}\\.(ino|cpp|c|h|hpp)")) }) {
+        "Use safe source filenames with .ino, .cpp, .c, .h or .hpp extensions."
+    }
+    val bytes = files.values.sumOf { it.toByteArray(Charsets.UTF_8).size }
+    require(bytes <= 90_000) { "Project source exceeds 90 KB. Split the project or remove large embedded data." }
+}
+
+private fun loadProjectFiles(prefs: android.content.SharedPreferences, project: String, defaultSource: String): Map<String, String> {
+    val raw = prefs.getString("projectFiles:$project", null) ?: return mapOf("main.ino" to defaultSource)
+    return runCatching {
+        val json = JSONObject(raw)
+        val result = linkedMapOf<String, String>()
+        json.keys().forEach { key ->
+            if (key.matches(Regex("[A-Za-z0-9_.-]{1,64}\\.(ino|cpp|c|h|hpp)"))) result[key] = json.getString(key)
+        }
+        if (result.containsKey("main.ino")) result else mapOf("main.ino" to defaultSource)
+    }.getOrDefault(mapOf("main.ino" to defaultSource))
+}
+
 private fun readFirmwareImages(context: Context, uri: Uri, boardId: String, rawAddress: String): List<FirmwareImage> {
     val displayName = queryDisplayName(context, uri).ifBlank { "firmware.bin" }
     val bytes = context.contentResolver.openInputStream(uri)?.use { it.readBytes() }
@@ -578,14 +639,15 @@ private fun parseHexAddress(value: String): Int {
 
 private fun compileOnline(
     endpoint: String, apiKey: String, board: String, fqbn: String,
-    project: String, source: String, libraryText: String
+    project: String, projectFiles: Map<String, String>, libraryText: String
 ): Result<ByteArray> = runCatching {
     require(endpoint.startsWith("https://")) { "Use an HTTPS build API URL in Settings." }
     require(apiKey.isNotBlank()) { "Enter the build API key in Settings." }
-    require(source.isNotBlank()) { "Sketch is empty." }
+    require(projectFiles.containsKey("main.ino") && projectFiles["main.ino"].orEmpty().isNotBlank()) { "main.ino is missing or empty." }
+    validateProjectFiles(projectFiles)
     val libs = JSONArray()
     libraryText.split(",").map { it.trim() }.filter { it.isNotBlank() }.forEach { libs.put(it) }
-    val files = JSONObject().put("main.ino", source)
+    val files = JSONObject(projectFiles)
     val body = JSONObject().put("board", board).put("fqbn", fqbn).put("files", files).put("libraries", libs)
     val url = URL(endpoint.trimEnd('/') + "/v1/compile")
     val conn = (url.openConnection() as HttpURLConnection).apply {
@@ -615,17 +677,23 @@ private fun compileOnline(
     bytes
 }
 
-private fun runOfflineCompile(activity: MainActivity, board: BoardOption, fqbn: String, project: String, source: String): Boolean {
+private fun runOfflineCompile(activity: MainActivity, board: BoardOption, fqbn: String, project: String, projectFiles: Map<String, String>): Boolean {
     return runCatching {
         require(fqbn.matches(Regex("[A-Za-z0-9_.:-]+"))) { "Invalid FQBN" }
+        validateProjectFiles(projectFiles)
+        require(projectFiles.containsKey("main.ino")) { "main.ino is required." }
         val sketch = "$WORKSPACE/Projects/$project"
         val libs = "$WORKSPACE/InstalledLibraries"
         val out = "$WORKSPACE/Builds/$project"
         val zipFolder = "$WORKSPACE/LibraryZips"
+        val sourceWriter = projectFiles.entries.joinToString("\n") { (name, text) ->
+            val encoded = Base64.encodeToString(text.toByteArray(Charsets.UTF_8), Base64.NO_WRAP)
+            "printf '%s' '$encoded' | base64 -d > '$sketch/$name'"
+        }
         val script = """
             set -e
             mkdir -p '$sketch' '$libs' '$out'
-            cat > '$sketch/main.ino'
+            $sourceWriter
             proot-distro login --bind /storage:/storage debian -- bash -lc 'set -e
               mkdir -p '${libs}' '${out}'
               for z in '${zipFolder}'/*.zip; do
@@ -647,7 +715,6 @@ private fun runOfflineCompile(activity: MainActivity, board: BoardOption, fqbn: 
             component = ComponentName("com.termux", "com.termux.app.RunCommandService")
             putExtra("com.termux.RUN_COMMAND_PATH", "${'$'}PREFIX/bin/bash")
             putExtra("com.termux.RUN_COMMAND_ARGUMENTS", arrayOf("-lc", script))
-            putExtra("com.termux.RUN_COMMAND_STDIN", source)
             putExtra("com.termux.RUN_COMMAND_BACKGROUND", false)
             putExtra("com.termux.RUN_COMMAND_WORKDIR", "${'$'}HOME")
             putExtra("com.termux.RUN_COMMAND_LABEL", "ESP Forge offline compile")
