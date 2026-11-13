@@ -48,7 +48,7 @@ private val boards = listOf(
     BoardOption("esp32_s3", "ESP32-S3 Dev Module", "esp32:esp32:esp32s3", "esp32:esp32"),
     BoardOption("esp8266", "ESP8266 NodeMCU", "esp8266:esp8266:nodemcuv2", "esp8266:esp8266"),
     BoardOption("stm32_bluepill", "STM32 Blue Pill (F1)", "STMicroelectronics:stm32:GenF1", "STMicroelectronics:stm32"),
-    BoardOption("ch32v003", "WCH CH32V003", "ch32-riscv-ug:CH32RV:CH32V003", "ch32-riscv-ug:CH32RV")
+    BoardOption("ch32v003", "WCH CH32V003", "ch32-riscv-noneos:ch32riscv:CH32V003", "ch32-riscv-ug:CH32RV")
 )
 
 class MainActivity : ComponentActivity() {
@@ -332,7 +332,7 @@ private fun compileOnline(
     endpoint: String, apiKey: String, board: String, fqbn: String,
     project: String, source: String, libraryText: String
 ): Result<ByteArray> = runCatching {
-    require(endpoint.startsWith("https://") || endpoint.startsWith("http://")) { "Enter a valid build API URL in Settings." }
+    require(endpoint.startsWith("https://")) { "Use an HTTPS build API URL in Settings." }
     require(apiKey.isNotBlank()) { "Enter the build API key in Settings." }
     require(source.isNotBlank()) { "Sketch is empty." }
     val libs = JSONArray()
