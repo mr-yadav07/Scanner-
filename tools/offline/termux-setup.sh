@@ -22,7 +22,7 @@ board_manager:
     - https://espressif.github.io/arduino-esp32/package_esp32_index.json
     - https://arduino.esp8266.com/stable/package_esp8266com_index.json
     - https://github.com/stm32duino/BoardManagerFiles/raw/main/package_stmicroelectronics_index.json
-    - https://raw.githubusercontent.com/ch32-riscv-ug/arduino_core_ch32_riscv_arduino/main/package_ch32-riscv-arduino.json
+    - https://github.com/openwch/board_manager_files/raw/main/package_ch32v_index.json
 EOF
 arduino-cli core update-index
 arduino-cli core install "'"$BOARD_CORE"'"
