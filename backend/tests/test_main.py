@@ -3,7 +3,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from app.main import CompileRequest, CORE_BY_BOARD, FQBN_BY_BOARD, auto_library_names
+from app.main import CompileRequest, CORE_BY_BOARD, DEFAULT_BOARD_OPTIONS, FQBN_BY_BOARD, auto_library_names
 
 
 def test_supported_board_presets_have_core_and_fqbn():
@@ -12,6 +12,8 @@ def test_supported_board_presets_have_core_and_fqbn():
     assert FQBN_BY_BOARD["arduino_uno"] == "arduino:avr:uno"
     assert CORE_BY_BOARD["ch32v003"] == "WCH:ch32v"
     assert FQBN_BY_BOARD["ch32v003"] == "WCH:ch32v:CH32V00x_EVT"
+    assert DEFAULT_BOARD_OPTIONS["stm32_bluepill"] == ["pnum=BLUEPILL_F103C8"]
+    assert DEFAULT_BOARD_OPTIONS["ch32v003"] == ["pnum=CH32V003F4"]
 
 
 def test_project_rejects_path_traversal():
