@@ -61,7 +61,7 @@ private val boards = listOf(
     BoardOption("esp32_s3", "ESP32-S3 Dev Module", "esp32:esp32:esp32s3", "esp32:esp32"),
     BoardOption("esp8266", "ESP8266 NodeMCU", "esp8266:esp8266:nodemcuv2", "esp8266:esp8266"),
     BoardOption("stm32_bluepill", "STM32 Blue Pill (F1)", "STMicroelectronics:stm32:GenF1", "STMicroelectronics:stm32"),
-    BoardOption("ch32v003", "WCH CH32V003", "ch32-riscv-arduino:ch32riscv:CH32V003", "ch32-riscv-arduino:ch32riscv")
+    BoardOption("ch32v003", "WCH CH32V003F4P6", "WCH:ch32v:CH32V00x_EVT", "WCH:ch32v")
 )
 
 class MainActivity : ComponentActivity() {
@@ -710,7 +710,7 @@ private fun compileOnline(
     val libs = JSONArray()
     libraryText.split(",").map { it.trim() }.filter { it.isNotBlank() }.forEach { libs.put(it) }
     val files = JSONObject(projectFiles)
-    val body = JSONObject().put("board", board).put("fqbn", fqbn).put("files", files).put("libraries", libs)
+    val body = JSONObject().put("board", board).put("fqbn", fqbn).put("files", files).put("libraries", libs).put("board_options", JSONObject().put("pnum", "CH32V003F4"))
     val url = URL(endpoint.trimEnd('/') + "/v1/compile")
     val conn = (url.openConnection() as HttpURLConnection).apply {
         requestMethod = "POST"
@@ -826,7 +826,7 @@ board_manager:
     - https://espressif.github.io/arduino-esp32/package_esp32_index.json
     - https://arduino.esp8266.com/stable/package_esp8266com_index.json
     - https://github.com/stm32duino/BoardManagerFiles/raw/main/package_stmicroelectronics_index.json
-    - https://raw.githubusercontent.com/ch32-riscv-ug/arduino_core_ch32_riscv_arduino/main/package_ch32-riscv-arduino.json
+    - https://github.com/openwch/board_manager_files/raw/main/package_ch32v_index.json
 EOF
               arduino-cli core update-index
               arduino-cli core install '${core}'
