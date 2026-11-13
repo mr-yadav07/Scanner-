@@ -22,7 +22,7 @@ Open the repository in Android Studio (JDK 17, Android SDK 35) and build the `ap
 2. Open the latest **ESP Forge CI** run.
 3. Download the `esp-forge-debug-apk` artifact after both jobs pass.
 
-The CI pipeline runs Android unit tests, assembles a debug APK, runs the Python backend tests, and checks backend syntax.
+The CI pipeline runs Android unit tests, assembles a debug APK, runs the Python backend tests, and checks backend syntax. The editor includes live online compiler logs, stage-based progress, elapsed time and cancellation; offline builds show Termux completion status and read the build log when shared-storage access permits.
 
 ## Online compilation setup
 
@@ -33,7 +33,7 @@ The Android client requires a deployed build API; no online compiler endpoint is
 3. Wait for `/health` to report `ok: true`.
 4. In the app, open Settings and enter the service HTTPS base URL and matching API key.
 
-The server installs the requested Arduino board core and dependencies, compiles the uploaded multi-file project, and returns a ZIP containing firmware files, a build manifest and logs. Arduino Library Manager headers are resolved from the live registry index when the index supplies include metadata. If a library is missing from that registry or its header cannot be mapped, add its exact Library Manager package name in the optional libraries field.
+The server installs the requested Arduino board core and dependencies, compiles the uploaded multi-file project, and returns a ZIP containing firmware files, a build manifest and logs. The app uses `/v1/compile/stream` for live build stages and compiler output; `/v1/compile` remains available for clients that expect a completed ZIP response. Progress percentages represent completed build stages, not a compiler-internal percentage (Arduino CLI does not expose a reliable exact percentage). Arduino Library Manager headers are resolved from the live registry index when the index supplies include metadata. If a library is missing from that registry or its header cannot be mapped, add its exact Library Manager package name in the optional libraries field.
 
 A hosted service needs sufficient memory and storage for the selected board packages, especially ESP32. Free hosting can cold-start, have limited resources and may not retain downloaded toolchains between restarts. A persistent disk and a more capable instance are recommended for reliable repeated builds.
 
