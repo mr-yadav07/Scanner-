@@ -56,6 +56,7 @@ FQBN_BY_BOARD = {
     "ch32v003": "WCH:ch32v:CH32V00x_EVT",
 }
 DEFAULT_BOARD_OPTIONS = {
+    "stm32_bluepill": ["pnum=BLUEPILL_F103C8"],
     "ch32v003": ["pnum=CH32V003F4"],
 }
 CORE_HEADERS = {
