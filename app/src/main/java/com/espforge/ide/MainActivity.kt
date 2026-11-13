@@ -20,6 +20,7 @@ class MainActivity : ComponentActivity() {
     }
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun ForgeHome() {
     var project by remember { mutableStateOf("MyFirmware") }
