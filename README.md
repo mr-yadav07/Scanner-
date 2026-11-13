@@ -64,4 +64,4 @@ Board core indexes are maintained by their upstream projects:
 - [Espressif Arduino-ESP32](https://espressif.github.io/arduino-esp32/package_esp32_index.json)
 - [ESP8266 Arduino core](https://arduino.esp8266.com/stable/package_esp8266com_index.json)
 - [STM32duino](https://github.com/stm32duino/BoardManagerFiles/raw/main/package_stmicroelectronics_index.json)
-- [CH32 RISC-V Arduino API core](https://raw.githubusercontent.com/ch32-riscv-ug/arduino_core_ch32_riscv_arduino/main/package_ch32-riscv-arduino.json)
+- [WCH Arduino Core for CH32](https://github.com/openwch/board_manager_files/raw/main/package_ch32v_index.json)
