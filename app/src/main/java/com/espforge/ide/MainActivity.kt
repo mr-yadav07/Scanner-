@@ -502,9 +502,9 @@ private fun ForgeHome(activity: MainActivity) {
                         } else {
                             busy = true
                             output = "Starting local Arduino CLI build in Termux. The first build needs the selected board core already installed."
-                            val success = runOfflineCompile(activity, board, fqbn, project, projectFiles)
+                            val success = if (board.id == "ch32v003") false else runOfflineCompile(activity, board, fqbn, project, projectFiles)
                             busy = false
-                            output = if (success) "Offline compile command sent to Termux. Check its build output; firmware is written to Documents/ESPForge/Builds/$project." else "Could not start Termux. Install Termux, allow external apps, grant Run commands permission and run the offline setup first."
+                            output = if (success) "Offline compile command sent to Termux. The result and firmware.zip are written to Documents/ESPForge/Builds/$project." else if (board.id == "ch32v003") "CH32 toolchain packages currently lack ARM64 Linux compiler binaries, so offline compilation on this Android phone is unavailable. Use Online mode." else "Could not start Termux. Install Termux, allow external apps, grant Run commands permission and run the offline setup first."
                         }
                     }, modifier = Modifier.fillMaxWidth()) { Text(if (busy) "Working…" else "Compile firmware") }
                 }
@@ -619,7 +619,7 @@ private fun ForgeHome(activity: MainActivity) {
                     Text("Offline prerequisites")
                     Text("Install Termux (F-Droid/GitHub release), open it once, run termux-setup-storage, set allow-external-apps=true in ~/.termux/termux.properties, then grant ESP Forge the 'Run commands in Termux environment' permission.")
                     Button(onClick = {
-                        val ok = runTermuxSetup(activity, board)
+                        val ok = if (board.id == "ch32v003") false else runTermuxSetup(activity, board)
                         output = if (ok) "Termux offline toolchain setup launched. Keep Termux open until downloads and core installation finish." else "Termux setup could not start. Check Termux installation and permissions."
                     }, modifier = Modifier.fillMaxWidth()) { Text("Prepare offline toolchain for selected board") }
                     Text("Offline setup downloads Linux toolchains once; later builds can run without internet when the selected board core and required libraries are already cached.")
@@ -671,7 +671,7 @@ private fun readFirmwareImages(context: Context, uri: Uri, boardId: String, rawA
                 entry = zip.nextEntry
             }
         }
-        if (entries.isEmpty()) throw IllegalArgumentException("ZIP contains no firmware .bin files.")
+        if (entries.isEmpty()) throw IllegalArgumentException("ZIP contains no supported firmware .bin or .hex files.")
         return entries.sortedBy { firmwareAddress(it.first, boardId) }
             .map { (name, data) -> FirmwareImage(name, data, firmwareAddress(name, boardId)) }
     }
@@ -770,7 +770,17 @@ private fun runOfflineCompile(activity: MainActivity, board: BoardOption, fqbn: 
                 rm -rf "${'$'}tmp"
               done
               cd '${sketch}'
-              arduino-cli compile --fqbn '${fqbn}' --libraries '${libs}' --output-dir '${out}' .
+              if ! arduino-cli compile --fqbn ''+fqbn+'' --libraries ''+libs+'' --output-dir ''+out+'' . > ''+out+'/build.log' 2>&1; then cat ''+out+'/build.log'; exit 1; fi
+              mkdir -p ''+out+'/package/firmware'
+              find ''+out+'' -maxdepth 1 -type f \\( -name '*.bin' -o -name '*.hex' -o -name '*.uf2' \\) -exec cp {} ''+out+'/package/firmware/' \\;
+              count=$(find ''+out+'/package/firmware' -type f | wc -l)
+              [ "$count" -gt 0 ] || { echo 'No firmware artifacts produced'; exit 2; }
+              printf '{"board":"'+board.id+'","fqbn":"'+fqbn+'"}' > ''+out+'/package/build-manifest.json'
+              cp ''+out+'/build.log' ''+out+'/package/build.log'
+              cd ''+out+'/package'
+              zip -qr ''+out+'/firmware.zip' firmware build-manifest.json build.log
+              rm -rf ''+out+'/package'
+              echo 'Build succeeded. Firmware package: '+out+'/firmware.zip'
             '
         """.trimIndent()
         val intent = Intent(TERMUX_ACTION).apply {
@@ -848,10 +858,10 @@ private fun copyToSharedLibraryFolder(context: Context, source: Uri, name: Strin
     val values = ContentValues().apply {
         put(MediaStore.MediaColumns.DISPLAY_NAME, name)
         put(MediaStore.MediaColumns.MIME_TYPE, "application/zip")
-        put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOCUMENTS + "/ESPForge/LibraryZips")
+        put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOCUMENTS + "/ESPForge/LibraryZips/")
         put(MediaStore.MediaColumns.IS_PENDING, 1)
     }
-    val uri = context.contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+    val uri = context.contentResolver.insert(MediaStore.Files.getContentUri("external"), values)
         ?: throw IllegalStateException("Could not create shared library ZIP")
     context.contentResolver.openInputStream(source)!!.use { input ->
         context.contentResolver.openOutputStream(uri)!!.use { output -> input.copyTo(output) }
