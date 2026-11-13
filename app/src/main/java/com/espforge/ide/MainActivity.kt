@@ -379,29 +379,29 @@ private fun runOfflineCompile(activity: MainActivity, board: BoardOption, fqbn: 
             mkdir -p '$sketch' '$libs' '$out'
             cat > '$sketch/main.ino'
             proot-distro login debian --bind /storage:/storage -- bash -lc 'set -e
-              mkdir -p '\${libs}' '\${out}'
-              for z in '\${zipFolder}'/*.zip; do
-                [ -f "\${'$'}z" ] || continue
-                tmp="\${'$'}(mktemp -d)"
-                unzip -oq "\${'$'}z" -d "\${'$'}tmp"
-                prop="\${'$'}(find "\${'$'}tmp" -name library.properties -print -quit)"
-                if [ -n "\${'$'}prop" ]; then
-                  src="\${'$'}(dirname "\${'$'}prop")"
-                  cp -a "\${'$'}src" "\${libs}/\${'$'}(basename "\${'$'}src")"
+              mkdir -p '${libs}' '${out}'
+              for z in '${zipFolder}'/*.zip; do
+                [ -f "${'$'}z" ] || continue
+                tmp="${'$'}(mktemp -d)"
+                unzip -oq "${'$'}z" -d "${'$'}tmp"
+                prop="${'$'}(find "${'$'}tmp" -name library.properties -print -quit)"
+                if [ -n "${'$'}prop" ]; then
+                  src="${'$'}(dirname "${'$'}prop")"
+                  cp -a "${'$'}src" "${libs}/${'$'}(basename "${'$'}src")"
                 fi
-                rm -rf "\${'$'}tmp"
+                rm -rf "${'$'}tmp"
               done
-              cd '\${sketch}'
-              arduino-cli compile --fqbn '\${fqbn}' --libraries '\${libs}' --output-dir '\${out}' .
+              cd '${sketch}'
+              arduino-cli compile --fqbn '${fqbn}' --libraries '${libs}' --output-dir '${out}' .
             '
         """.trimIndent()
         val intent = Intent(TERMUX_ACTION).apply {
             component = ComponentName("com.termux", "com.termux.app.RunCommandService")
-            putExtra("com.termux.RUN_COMMAND_PATH", "\${'$'}PREFIX/bin/bash")
+            putExtra("com.termux.RUN_COMMAND_PATH", "${'$'}PREFIX/bin/bash")
             putExtra("com.termux.RUN_COMMAND_ARGUMENTS", arrayOf("-lc", script))
             putExtra("com.termux.RUN_COMMAND_STDIN", source)
             putExtra("com.termux.RUN_COMMAND_BACKGROUND", false)
-            putExtra("com.termux.RUN_COMMAND_WORKDIR", "\${'$'}HOME")
+            putExtra("com.termux.RUN_COMMAND_WORKDIR", "${'$'}HOME")
             putExtra("com.termux.RUN_COMMAND_LABEL", "ESP Forge offline compile")
         }
         activity.startService(intent)
@@ -417,13 +417,13 @@ private fun runTermuxSetup(activity: MainActivity, board: BoardOption): Boolean 
             set -e
             pkg update -y
             pkg install -y proot-distro
-            if [ ! -d "\${'$'}PREFIX/var/lib/proot-distro/installed-rootfs/debian" ]; then proot-distro install debian; fi
+            if [ ! -d "${'$'}PREFIX/var/lib/proot-distro/installed-rootfs/debian" ]; then proot-distro install debian; fi
             proot-distro login debian -- bash -lc 'set -e
               apt-get update
               apt-get install -y curl ca-certificates unzip python3
-              arch="\${'$'}(dpkg --print-architecture)"
-              if [ "\${'$'}arch" = "arm64" ]; then asset="Linux_ARM64"; elif [ "\${'$'}arch" = "amd64" ]; then asset="Linux_64bit"; else echo "Unsupported Debian architecture: \${'$'}arch"; exit 2; fi
-              curl -fsSL "https://downloads.arduino.cc/arduino-cli/arduino-cli_1.5.1_\${'$'}{asset}.tar.gz" -o /tmp/arduino-cli.tar.gz
+              arch="${'$'}(dpkg --print-architecture)"
+              if [ "${'$'}arch" = "arm64" ]; then asset="Linux_ARM64"; elif [ "${'$'}arch" = "amd64" ]; then asset="Linux_64bit"; else echo "Unsupported Debian architecture: ${'$'}arch"; exit 2; fi
+              curl -fsSL "https://downloads.arduino.cc/arduino-cli/arduino-cli_1.5.1_${'$'}{asset}.tar.gz" -o /tmp/arduino-cli.tar.gz
               tar -xzf /tmp/arduino-cli.tar.gz -C /usr/local/bin arduino-cli
               mkdir -p /root/.arduino15
               cat > /root/.arduino15/arduino-cli.yaml <<EOF
@@ -435,16 +435,16 @@ board_manager:
     - https://ch32-riscv-ug.github.io/ArduinoCore-CH32RV/package_ch32-riscv-ug_index.json
 EOF
               arduino-cli core update-index
-              arduino-cli core install '\${core}'
-              echo "Offline toolchain installed for \${fqbn}"
+              arduino-cli core install '${core}'
+              echo "Offline toolchain installed for ${fqbn}"
             '
         """.trimIndent()
         val intent = Intent(TERMUX_ACTION).apply {
             component = ComponentName("com.termux", "com.termux.app.RunCommandService")
-            putExtra("com.termux.RUN_COMMAND_PATH", "\${'$'}PREFIX/bin/bash")
+            putExtra("com.termux.RUN_COMMAND_PATH", "${'$'}PREFIX/bin/bash")
             putExtra("com.termux.RUN_COMMAND_ARGUMENTS", arrayOf("-lc", script))
             putExtra("com.termux.RUN_COMMAND_BACKGROUND", false)
-            putExtra("com.termux.RUN_COMMAND_WORKDIR", "\${'$'}HOME")
+            putExtra("com.termux.RUN_COMMAND_WORKDIR", "${'$'}HOME")
             putExtra("com.termux.RUN_COMMAND_LABEL", "ESP Forge toolchain setup")
         }
         activity.startService(intent)
