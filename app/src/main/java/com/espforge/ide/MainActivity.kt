@@ -464,7 +464,38 @@ private fun ForgeHome(activity: MainActivity, themeMode: String, onThemeChange: 
 
     LaunchedEffect(Unit) { refreshLibraries(); refreshUsbDevices() }
     LaunchedEffect(activity.offlineBuildOutput) {
-        if (activity.offlineBuildOutput.isNotBlank()) output = activity.offlineBuildOutput
+        if (activity.offlineBuildOutput.isNotBlank()) {
+            output = activity.offlineBuildOutput
+            busy = false
+            val success = activity.offlineBuildOutput.contains("exit code: 0")
+            buildStage = if (success) "Build succeeded" else "Build failed"
+            buildProgress = if (success) 100 else buildProgress
+            buildLog = (buildLog + "\n" + activity.offlineBuildOutput).takeLast(24000)
+        }
+    }
+    LaunchedEffect(busy, mode, project) {
+        if (busy && mode == "Offline") {
+            val logFile = File("/storage/emulated/0/Documents/ESPForge/Builds/$project/build.log")
+            while (busy && mode == "Offline") {
+                runCatching {
+                    if (logFile.exists()) {
+                        val tail = logFile.readText().takeLast(20000)
+                        if (tail.isNotBlank()) {
+                            buildLog = tail
+                            buildStage = "Compiling · Termux"
+                            buildProgress = maxOf(buildProgress, 55)
+                        }
+                    }
+                }
+                delay(650)
+            }
+        }
+    }
+    LaunchedEffect(busy) {
+        while (busy) {
+            buildElapsed = if (buildStartedAt > 0L) (android.os.SystemClock.elapsedRealtime() - buildStartedAt) / 1000L else 0L
+            delay(500)
+        }
     }
 
     Scaffold(topBar = { TopAppBar(title = { Text("ESP Forge IDE") }, actions = {
@@ -519,10 +550,35 @@ private fun ForgeHome(activity: MainActivity, themeMode: String, onThemeChange: 
                         TextButton(
                             enabled = activeFileName != "main.ino" && activeFileName in projectFiles,
                             onClick = {
-                                saveFiles(projectFiles - activeFileName)
-                                activeFileName = projectFiles.keys.firstOrNull { it != activeFileName } ?: "main.ino"
+                                val name = activeFileName
+                                saveRemovedFiles(removedFiles + (name to projectFiles.getValue(name)))
+                                saveFiles(projectFiles - name)
+                                activeFileName = projectFiles.keys.firstOrNull() ?: "main.ino"
                             }
+                        ) { Text("Remove") }
+                        TextButton(
+                            enabled = activeFileName != "main.ino" && activeFileName in projectFiles,
+                            onClick = { deleteTarget = activeFileName }
                         ) { Text("Delete") }
+                        TextButton(
+                            enabled = activeFileName != "main.ino" && activeFileName in projectFiles,
+                            onClick = { renameTarget = activeFileName; renameValue = activeFileName }
+                        ) { Text("Rename") }
+                    }
+                    if (removedFiles.isNotEmpty()) {
+                        Text("Removed from project", style = MaterialTheme.typography.titleSmall)
+                        removedFiles.forEach { (name, source) ->
+                            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                                Text(name, modifier = Modifier.weight(1f))
+                                TextButton(onClick = {
+                                    if (name !in projectFiles) {
+                                        saveFiles(projectFiles + (name to source))
+                                        saveRemovedFiles(removedFiles - name)
+                                    }
+                                }) { Text("Restore") }
+                                TextButton(onClick = { saveRemovedFiles(removedFiles - name) }) { Text("Delete permanently") }
+                            }
+                        }
                     }
                     OutlinedTextField(
                         projectFiles[activeFileName].orEmpty(),
@@ -658,6 +714,14 @@ private fun ForgeHome(activity: MainActivity, themeMode: String, onThemeChange: 
                     Text("USB host support depends on phone OTG hardware and adapter compatibility.")
                 }
                 else -> {
+                    Text("Appearance", style = MaterialTheme.typography.titleMedium)
+                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        listOf("Light", "Dark", "AMOLED").forEach { theme ->
+                            FilterChip(selected = themeMode == theme, onClick = { onThemeChange(theme) }, label = { Text(theme) })
+                        }
+                    }
+                    Text("Theme selection is saved on this device.", style = MaterialTheme.typography.bodySmall)
+                    Divider()
                     Text("Online build service")
                     OutlinedTextField(endpoint, { endpoint = it }, label = { Text("Build API base URL (e.g. https://your-host)") }, singleLine = true, modifier = Modifier.fillMaxWidth())
                     OutlinedTextField(apiKey, { apiKey = it }, label = { Text("Build API key") }, singleLine = true, modifier = Modifier.fillMaxWidth())
