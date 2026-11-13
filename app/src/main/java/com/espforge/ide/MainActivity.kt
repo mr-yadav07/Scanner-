@@ -589,27 +589,78 @@ private fun ForgeHome(activity: MainActivity, themeMode: String, onThemeChange: 
                     )
                     OutlinedTextField(extraLibraries, { extraLibraries = it }, label = { Text("Additional library names (comma separated, optional)") }, minLines = 1, modifier = Modifier.fillMaxWidth())
                     Button(enabled = !busy, onClick = {
+                        cancelRequested = false
+                        buildProgress = 0
+                        buildStage = "Starting"
+                        buildLog = ""
+                        buildStartedAt = android.os.SystemClock.elapsedRealtime()
+                        buildElapsed = 0
                         if (mode == "Online") {
-                            busy = true; output = "Sending sketch to remote Arduino CLI compiler…"
+                            busy = true
+                            output = "Connecting to streaming Arduino CLI compiler…"
+                            buildLog = "Build requested · $project · ${board.label} · $fqbn\n"
                             scope.launch {
                                 val result = withContext(Dispatchers.IO) {
-                                    compileOnline(endpoint, apiKey, board.id, fqbn, project, projectFiles, extraLibraries)
+                                    compileOnline(activity, endpoint, apiKey, board.id, fqbn, project, projectFiles, extraLibraries) { stage, percent, message, isLog ->
+                                        activity.runOnUiThread {
+                                            buildStage = stage
+                                            if (percent >= 0) buildProgress = percent
+                                            if (message.isNotBlank()) {
+                                                buildLog = (buildLog + (if (isLog) message + "\n" else "[$stage] $message\n")).takeLast(24000)
+                                            }
+                                        }
+                                    }
                                 }
                                 busy = false
                                 result.onSuccess { bytes ->
                                     pendingZip = bytes
                                     output = "Online compilation succeeded. Firmware archive received; save it from the prompt."
                                     saveBuildLauncher.launch("${project}-firmware.zip")
-                                }.onFailure { output = "Online build failed: ${it.message}" }
+                                }.onFailure {
+                                    output = if (cancelRequested) "Build cancelled." else "Online build failed: ${it.message}"
+                                    buildStage = if (cancelRequested) "Cancelled" else "Build failed"
+                                    buildLog = (buildLog + "\n" + output).takeLast(24000)
+                                }
                             }
                         } else {
                             busy = true
-                            output = "Starting local Arduino CLI build in Termux. The first build needs the selected board core already installed."
+                            buildStage = "Starting Termux"
+                            buildProgress = 3
+                            output = "Starting local Arduino CLI build in Termux. Live output will appear below."
                             val success = if (board.id == "ch32v003") false else runOfflineCompile(activity, board, fqbn, project, projectFiles)
-                            busy = false
-                            output = if (success) "Offline compile command sent to Termux. The result and firmware.zip are written to Documents/ESPForge/Builds/$project." else if (board.id == "ch32v003") "CH32 toolchain packages currently lack ARM64 Linux compiler binaries, so offline compilation on this Android phone is unavailable. Use Online mode." else "Could not start Termux. Install Termux, allow external apps, grant Run commands permission and run the offline setup first."
+                            if (success) {
+                                activity.offlineBuildRunning = true
+                                buildStage = "Waiting for Termux"
+                                buildLog = "Termux accepted the build command. Waiting for compiler output…"
+                                buildProgress = 5
+                                output = "Offline build started. Compiler output is being monitored."
+                            } else {
+                                busy = false
+                                buildStage = "Could not start"
+                                output = if (board.id == "ch32v003") "CH32 toolchain packages currently lack ARM64 Linux compiler binaries, so offline compilation on this Android phone is unavailable. Use Online mode." else "Could not start Termux. Install Termux, allow external apps, grant Run commands permission and run the offline setup first."
+                                buildLog = output
+                            }
                         }
-                    }, modifier = Modifier.fillMaxWidth()) { Text(if (busy) "Working…" else "Compile firmware") }
+                    }, modifier = Modifier.fillMaxWidth()) { Text(if (busy) "Building…" else "Compile firmware") }
+                    if (busy && mode == "Online") {
+                        OutlinedButton(onClick = {
+                            cancelRequested = true
+                            activity.cancelOnlineBuild()
+                        }, modifier = Modifier.fillMaxWidth()) { Text("Cancel build") }
+                    }
+                    if (buildStage != "Idle") {
+                        Text("Build progress · $buildStage", style = MaterialTheme.typography.titleSmall)
+                        LinearProgressIndicator(
+                            progress = { buildProgress.coerceIn(0, 100) / 100f },
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                        Text("$buildProgress% · $buildElapsed s elapsed", style = MaterialTheme.typography.bodySmall)
+                        Surface(color = MaterialTheme.colorScheme.surfaceVariant, modifier = Modifier.fillMaxWidth()) {
+                            Text(buildLog.ifBlank { "Waiting for compiler output…" },
+                                modifier = Modifier.padding(10.dp).heightIn(min = 80.dp, max = 260.dp).verticalScroll(rememberScrollState()),
+                                style = MaterialTheme.typography.bodySmall)
+                        }
+                    }
                 }
                 "Libraries" -> {
                     Text("Online mode: known #include dependencies are looked up in the Arduino Library Manager index and fetched by the build server. No ZIP upload is needed.")
