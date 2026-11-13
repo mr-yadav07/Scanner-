@@ -3,6 +3,7 @@ package com.espforge.ide
 import android.app.PendingIntent
 import android.content.*
 import android.hardware.usb.UsbManager
+import android.hardware.usb.UsbDevice
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -24,11 +25,19 @@ import androidx.compose.ui.unit.dp
 import com.hoho.android.usbserial.driver.UsbSerialDriver
 import com.hoho.android.usbserial.driver.UsbSerialPort
 import com.hoho.android.usbserial.driver.UsbSerialProber
+import dev.espflasher.app.domain.ChipId
+import dev.espflasher.app.domain.EspFlasher
+import dev.espflasher.app.domain.FirmwareImage
+import dev.espflasher.app.domain.FlashProgress
+import dev.espflasher.app.flash.Esp32Flasher
+import dev.espflasher.app.flash.Esp8266Flasher
+import dev.espflasher.app.usb.UsbSerialTransport
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.net.HttpURLConnection
@@ -36,11 +45,13 @@ import java.net.URL
 import java.util.zip.ZipInputStream
 
 private const val USB_PERMISSION_ACTION = "com.espforge.ide.USB_PERMISSION"
+private const val FLASH_USB_PERMISSION_ACTION = "com.espforge.ide.FLASH_USB_PERMISSION"
 private const val TERMUX_ACTION = "com.termux.RUN_COMMAND"
 private const val WORKSPACE = "/storage/emulated/0/Documents/ESPForge"
 private const val LIBRARY_ZIPS = "$WORKSPACE/LibraryZips"
 
 private data class BoardOption(val id: String, val label: String, val fqbn: String, val core: String)
+private data class FlashPermissionResult(val device: UsbDevice, val granted: Boolean)
 private val boards = listOf(
     BoardOption("arduino_uno", "Arduino Uno", "arduino:avr:uno", "arduino:avr"),
     BoardOption("arduino_nano", "Arduino Nano", "arduino:avr:nano", "arduino:avr"),
@@ -48,7 +59,7 @@ private val boards = listOf(
     BoardOption("esp32_s3", "ESP32-S3 Dev Module", "esp32:esp32:esp32s3", "esp32:esp32"),
     BoardOption("esp8266", "ESP8266 NodeMCU", "esp8266:esp8266:nodemcuv2", "esp8266:esp8266"),
     BoardOption("stm32_bluepill", "STM32 Blue Pill (F1)", "STMicroelectronics:stm32:GenF1", "STMicroelectronics:stm32"),
-    BoardOption("ch32v003", "WCH CH32V003", "ch32-riscv-noneos:ch32riscv:CH32V003", "ch32-riscv-ug:CH32RV")
+    BoardOption("ch32v003", "WCH CH32V003", "ch32-riscv-noneos:ch32riscv:CH32V003", "ch32-riscv-noneos:ch32riscv")
 )
 
 class MainActivity : ComponentActivity() {
@@ -62,9 +73,14 @@ class MainActivity : ComponentActivity() {
 
     private val usbPermissionReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
+            val device = intent.getParcelableExtra<UsbDevice>(UsbManager.EXTRA_DEVICE)
+            val granted = intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false)
+            if (intent.action == FLASH_USB_PERMISSION_ACTION) {
+                if (device != null) flashPermissionResult = FlashPermissionResult(device, granted)
+                return
+            }
             if (intent.action != USB_PERMISSION_ACTION) return
-            val device = intent.getParcelableExtra<android.hardware.usb.UsbDevice>(UsbManager.EXTRA_DEVICE)
-            if (intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false) && device != null) {
+            if (granted && device != null) {
                 pendingDriver?.takeIf { it.device.deviceId == device.deviceId }?.let { openSerial(it) }
             } else {
                 serialStatus = "USB permission denied"
@@ -74,10 +90,60 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        val filter = IntentFilter(USB_PERMISSION_ACTION)
+        val filter = IntentFilter().apply { addAction(USB_PERMISSION_ACTION); addAction(FLASH_USB_PERMISSION_ACTION) }
         if (Build.VERSION.SDK_INT >= 33) registerReceiver(usbPermissionReceiver, filter, RECEIVER_NOT_EXPORTED)
         else @Suppress("DEPRECATION") registerReceiver(usbPermissionReceiver, filter)
         setContent { MaterialTheme { ForgeHome(this) } }
+    }
+
+    fun consumeFlashPermission() { flashPermissionResult = null }
+
+    fun requestFlashPermission(device: UsbDevice) {
+        val manager = getSystemService(USB_SERVICE) as UsbManager
+        if (manager.hasPermission(device)) {
+            flashPermissionResult = FlashPermissionResult(device, true)
+            return
+        }
+        val permission = PendingIntent.getBroadcast(
+            this, device.deviceId + 10_000,
+            Intent(FLASH_USB_PERMISSION_ACTION).setPackage(packageName),
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_MUTABLE
+        )
+        manager.requestPermission(device, permission)
+    }
+
+    suspend fun flashEspFirmware(
+        device: UsbDevice,
+        boardId: String,
+        images: List<FirmwareImage>,
+        onProgress: (FlashProgress) -> Unit
+    ): String = withContext(Dispatchers.IO) {
+        require(boardId == "esp8266" || boardId == "esp32" || boardId == "esp32_s3") {
+            "Direct USB flashing is currently implemented for ESP8266, ESP32 and ESP32-S3 only."
+        }
+        require(images.isNotEmpty()) { "No firmware images were selected." }
+        val manager = getSystemService(USB_SERVICE) as UsbManager
+        val transport = UsbSerialTransport(manager, device, UsbSerialTransport.labelFor(device))
+        val chip = when (boardId) {
+            "esp8266" -> ChipId.ESP8266
+            "esp32_s3" -> ChipId.ESP32_S3
+            else -> ChipId.ESP32
+        }
+        val flasher: EspFlasher = if (boardId == "esp8266") {
+            Esp8266Flasher(transport, autoReset = true)
+        } else {
+            Esp32Flasher(transport, autoReset = true, forcedChip = chip)
+        }
+        try {
+            flasher.connect()
+            val detected = flasher.detectChip()
+            flasher.writeFirmware(images) { onProgress(it) }
+            flasher.verifyFirmware(images)
+            flasher.reset()
+            "Flash and MD5 verification succeeded. Detected: ${detected.description}, flash: ${detected.flashSizeLabel}."
+        } finally {
+            flasher.disconnect()
+        }
     }
 
     fun connectSerial() {
@@ -180,8 +246,20 @@ private fun ForgeHome(activity: MainActivity) {
     var pendingZip by remember { mutableStateOf<ByteArray?>(null) }
     var pendingExport by remember { mutableStateOf<File?>(null) }
     var libraryFiles by remember { mutableStateOf(listOf<File>()) }
+    var usbDevices by remember { mutableStateOf(emptyList<UsbDevice>()) }
+    var selectedUsbId by remember { mutableStateOf<Int?>(null) }
+    var firmwareImages by remember { mutableStateOf(emptyList<FirmwareImage>()) }
+    var firmwareLabel by remember { mutableStateOf("No firmware selected") }
+    var flashAddress by remember { mutableStateOf("0x10000") }
+    var flashProgress by remember { mutableStateOf(0f) }
+    val usbManager = remember { context.getSystemService(ComponentActivity.USB_SERVICE) as UsbManager }
+    val selectedUsb = usbDevices.firstOrNull { it.deviceId == selectedUsbId }
     val libDir = remember { File(context.filesDir, "library-zips").apply { mkdirs() } }
     fun refreshLibraries() { libraryFiles = libDir.listFiles()?.filter { it.isFile && it.extension.lowercase() == "zip" }?.sortedBy { it.name } ?: emptyList() }
+    fun refreshUsbDevices() {
+        usbDevices = usbManager.deviceList.values.toList()
+        if (usbDevices.none { it.deviceId == selectedUsbId }) selectedUsbId = usbDevices.firstOrNull()?.deviceId
+    }
 
     val saveBuildLauncher = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/zip")) { uri ->
         val bytes = pendingZip
@@ -199,6 +277,19 @@ private fun ForgeHome(activity: MainActivity) {
         }.onFailure { output = "Export failed: ${it.message}" }
         pendingExport = null
     }
+    val firmwarePicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri != null) {
+            scope.launch {
+                runCatching {
+                    val loaded = withContext(Dispatchers.IO) { readFirmwareImages(context, uri, board.id, flashAddress) }
+                    firmwareImages = loaded
+                    firmwareLabel = queryDisplayName(context, uri).ifBlank { "Firmware package" } + " · ${loaded.size} image(s)"
+                    output = "Firmware loaded. Review the target board and USB device before flashing."
+                }.onFailure { output = "Firmware selection failed: ${it.message}" }
+            }
+        }
+    }
+
     val importLibraryLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         if (uri != null) runCatching {
             val name = queryDisplayName(context, uri).ifBlank { "library-${System.currentTimeMillis()}.zip" }
@@ -211,7 +302,7 @@ private fun ForgeHome(activity: MainActivity) {
         }.onFailure { output = "Library import failed: ${it.message}" }
     }
 
-    LaunchedEffect(Unit) { refreshLibraries() }
+    LaunchedEffect(Unit) { refreshLibraries(); refreshUsbDevices() }
 
     Scaffold(topBar = { TopAppBar(title = { Text("ESP Forge IDE") }, actions = {
         Text(if (busy) "BUILDING" else "v0.2", style = MaterialTheme.typography.labelMedium, modifier = Modifier.padding(end = 12.dp))
@@ -285,10 +376,67 @@ private fun ForgeHome(activity: MainActivity) {
                     }
                 }
                 "Upload" -> {
-                    Text("Firmware upload is a local USB operation. Online builds return a firmware ZIP; cloud servers cannot directly access the phone's OTG cable.")
-                    Text("USB serial driver detection is available in the Serial tab. Board-specific bootloader flashing is not yet wired into this build.")
-                    Button(onClick = { activity.connectSerial(); output = activity.serialStatus }, modifier = Modifier.fillMaxWidth()) { Text("Detect USB serial device") }
-                    Text("For now, extract the generated firmware ZIP and use a board-specific uploader. Do not flash an arbitrary .bin file at address 0x0; ESP32 images may include several files with different offsets.")
+                    Text("Firmware is flashed locally over USB OTG. Choose a build ZIP or raw .bin file.")
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        OutlinedButton(onClick = { refreshUsbDevices() }) { Text("Refresh USB") }
+                        OutlinedButton(onClick = { firmwarePicker.launch(arrayOf("*/*")) }) { Text("Choose firmware") }
+                    }
+                    var deviceExpanded by remember { mutableStateOf(false) }
+                    ExposedDropdownMenuBox(expanded = deviceExpanded, onExpandedChange = { deviceExpanded = !deviceExpanded }) {
+                        OutlinedTextField(
+                            selectedUsb?.let { "${it.deviceName} · VID ${it.vendorId.toString(16)} PID ${it.productId.toString(16)}" } ?: "No USB device detected",
+                            {}, readOnly = true, label = { Text("USB OTG device") },
+                            trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(deviceExpanded) },
+                            modifier = Modifier.menuAnchor().fillMaxWidth()
+                        )
+                        ExposedDropdownMenu(expanded = deviceExpanded, onDismissRequest = { deviceExpanded = false }) {
+                            usbDevices.forEach { dev ->
+                                DropdownMenuItem(
+                                    text = { Text("${dev.deviceName} · ${dev.vendorId.toString(16)}:${dev.productId.toString(16)}") },
+                                    onClick = { selectedUsbId = dev.deviceId; deviceExpanded = false }
+                                )
+                            }
+                        }
+                    }
+                    Text(firmwareLabel)
+                    OutlinedTextField(flashAddress, { flashAddress = it }, label = { Text("Raw .bin flash address (hex)") }, singleLine = true, modifier = Modifier.fillMaxWidth())
+                    Text("Automatic multi-image offsets for standard Arduino ESP32 ZIPs: bootloader 0x1000, partitions 0x8000, boot_app0 0xE000 and app 0x10000. ESP8266 uses 0x0.")
+                    firmwareImages.forEach { image ->
+                        Text("${image.name} → 0x${image.address.toString(16)} · ${image.size} bytes", style = MaterialTheme.typography.bodySmall)
+                    }
+                    if (flashProgress > 0f && flashProgress < 100f) LinearProgressIndicator(progress = { flashProgress / 100f }, modifier = Modifier.fillMaxWidth())
+                    Button(
+                        enabled = !busy && selectedUsb != null && firmwareImages.isNotEmpty() && board.id in listOf("esp8266", "esp32", "esp32_s3"),
+                        onClick = {
+                            val dev = selectedUsb
+                            if (dev == null) output = "Connect the board through a USB OTG adapter first."
+                            else if (firmwareImages.isEmpty()) output = "Choose a valid firmware ZIP or .bin file first."
+                            else activity.requestFlashPermission(dev)
+                        },
+                        modifier = Modifier.fillMaxWidth()
+                    ) { Text(if (busy) "Flashing…" else "Flash + verify") }
+                    Text("Direct USB flashing is currently implemented for ESP8266, ESP32 and ESP32-S3. AVR, STM32 and CH32 compile targets are included; their native Android upload protocols still need implementation.")
+                    LaunchedEffect(activity.flashPermissionResult) {
+                        val result = activity.flashPermissionResult
+                        if (result != null) {
+                            activity.consumeFlashPermission()
+                            if (!result.granted) {
+                                output = "Android USB permission was denied."
+                            } else if (selectedUsb?.deviceId == result.device.deviceId && firmwareImages.isNotEmpty()) {
+                                busy = true
+                                flashProgress = 0f
+                                output = "Entering ROM bootloader and flashing firmware…"
+                                val attempt = runCatching {
+                                    activity.flashEspFirmware(result.device, board.id, firmwareImages) { progress ->
+                                        activity.runOnUiThread { flashProgress = progress.percent }
+                                    }
+                                }
+                                busy = false
+                                attempt.onSuccess { output = it; flashProgress = 100f }
+                                    .onFailure { output = "Flash failed: ${it.message}" }
+                            }
+                        }
+                    }
                 }
                 "Serial" -> {
                     Text(activity.serialStatus)
@@ -326,6 +474,49 @@ private fun ForgeHome(activity: MainActivity) {
             }
         }
     }
+}
+
+private fun readFirmwareImages(context: Context, uri: Uri, boardId: String, rawAddress: String): List<FirmwareImage> {
+    val displayName = queryDisplayName(context, uri).ifBlank { "firmware.bin" }
+    val bytes = context.contentResolver.openInputStream(uri)?.use { it.readBytes() }
+        ?: throw IllegalArgumentException("Unable to read selected firmware.")
+    if (displayName.endsWith(".zip", true) || (bytes.size >= 2 && bytes[0] == 0x50.toByte() && bytes[1] == 0x4B.toByte())) {
+        val entries = mutableListOf<Pair<String, ByteArray>>()
+        ZipInputStream(ByteArrayInputStream(bytes)).use { zip ->
+            var entry = zip.nextEntry
+            while (entry != null) {
+                if (!entry.isDirectory && entry.name.startsWith("firmware/") && entry.name.endsWith(".bin", true)) {
+                    entries += entry.name.substringAfterLast('/') to zip.readBytes()
+                }
+                zip.closeEntry()
+                entry = zip.nextEntry
+            }
+        }
+        if (entries.isEmpty()) throw IllegalArgumentException("ZIP contains no firmware .bin files.")
+        return entries.sortedBy { firmwareAddress(it.first, boardId) }
+            .map { (name, data) -> FirmwareImage(name, data, firmwareAddress(name, boardId)) }
+    }
+    if (!displayName.endsWith(".bin", true)) throw IllegalArgumentException("Choose a firmware ZIP or raw .bin file.")
+    return listOf(FirmwareImage(displayName, bytes, parseHexAddress(rawAddress)))
+}
+
+private fun firmwareAddress(name: String, boardId: String): Int {
+    val n = name.lowercase()
+    return when {
+        "merged" in n || "combined" in n -> 0
+        boardId == "esp8266" -> 0
+        "bootloader" in n -> 0x1000
+        "partition" in n -> 0x8000
+        "boot_app0" in n || "bootapp0" in n -> 0xE000
+        else -> 0x10000
+    }
+}
+
+private fun parseHexAddress(value: String): Int {
+    val normalized = value.trim().removePrefix("0x").removePrefix("0X")
+    val parsed = normalized.toLong(16)
+    require(parsed in 0..0xFFFFFFFFL) { "Flash address is out of range." }
+    return parsed.toInt()
 }
 
 private fun compileOnline(
