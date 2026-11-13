@@ -68,6 +68,7 @@ class MainActivity : ComponentActivity() {
         private set
     var serialText by mutableStateOf("")
         private set
+    internal var flashPermissionResult by mutableStateOf<FlashPermissionResult?>(null)
     private var serialPort: UsbSerialPort? = null
     private var pendingDriver: UsbSerialDriver? = null
     @Volatile private var readingSerial = false
@@ -138,7 +139,8 @@ class MainActivity : ComponentActivity() {
         try {
             flasher.connect()
             val detected = flasher.detectChip()
-            require(detected.chipId == chip) { "Selected target is $chip but the connected board reports ${detected.chipId}. Flash cancelled." }\n            flasher.writeFirmware(images) { onProgress(it) }
+            require(detected.chipId == chip) { "Selected target is $chip but the connected board reports ${detected.chipId}. Flash cancelled." }
+            flasher.writeFirmware(images) { onProgress(it) }
             flasher.verifyFirmware(images)
             flasher.reset()
             "Flash and MD5 verification succeeded. Detected: ${detected.description}, flash: ${detected.flashSizeLabel}."
