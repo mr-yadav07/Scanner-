@@ -1,0 +1,5 @@
+ESP Forge AVR ISP uploader
+
+The ATmega328P STK500v1 serial bootloader commands are implemented from the public
+STK500 protocol and Arduino AVR bootloader behavior. No third-party code is copied
+into this file. AVRDUDE and Arduino AVR Boards are separate upstream projects.
