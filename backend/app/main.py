@@ -321,7 +321,7 @@ def compile_project_stream(request: CompileRequest, x_api_key: str | None = Head
         started = time.monotonic()
 
         def send(kind: str, **payload):
-            return "data: " + json.dumps({"type": kind, **payload}, ensure_ascii=False) + "\\n\\n"
+            return "data: " + json.dumps({"type": kind, **payload}, ensure_ascii=False) + "\n\n"
 
         try:
             yield send("progress", stage="Preparing project", progress=3, message="Validating source files and preparing workspace.")
@@ -391,9 +391,9 @@ def compile_project_stream(request: CompileRequest, x_api_key: str | None = Head
                     if not chunk:
                         break
                     pending += chunk
-                    while b"\\n" in pending:
-                        raw, pending = pending.split(b"\\n", 1)
-                        line = raw.decode("utf-8", errors="replace").rstrip("\\r")
+                    while b"\n" in pending:
+                        raw, pending = pending.split(b"\n", 1)
+                        line = raw.decode("utf-8", errors="replace").rstrip("\r")
                         if line:
                             compile_log.append(line)
                             yield send("log", stage="Compiling", message=line)
@@ -405,14 +405,14 @@ def compile_project_stream(request: CompileRequest, x_api_key: str | None = Head
                     yield send("heartbeat", stage="Compiling", message="Compiler is still running; waiting for the next compiler output.")
                     last_heartbeat = time.monotonic()
             if pending.strip():
-                line = pending.decode("utf-8", errors="replace").rstrip("\\r")
+                line = pending.decode("utf-8", errors="replace").rstrip("\r")
                 compile_log.append(line)
                 yield send("log", stage="Compiling", message=line)
             return_code = process.wait(timeout=5)
             selector.close()
             process = None
             if return_code:
-                raise RuntimeError("Compilation failed (exit code " + str(return_code) + "):\\n" + "\\n".join(compile_log[-400:]))
+                raise RuntimeError("Compilation failed (exit code " + str(return_code) + "):\n" + "\n".join(compile_log[-400:]))
 
             yield send("progress", stage="Packaging firmware", progress=92, message="Compilation succeeded. Collecting firmware artifacts.")
             artifacts = [p for p in outdir.rglob("*") if p.is_file() and p.suffix.lower() in {".bin", ".hex", ".elf", ".eep", ".uf2"}]
@@ -427,7 +427,7 @@ def compile_project_stream(request: CompileRequest, x_api_key: str | None = Head
             memory = io.BytesIO()
             with zipfile.ZipFile(memory, "w", compression=zipfile.ZIP_DEFLATED) as archive:
                 archive.writestr("build-manifest.json", json.dumps(manifest, indent=2))
-                archive.writestr("build.log", "\\n".join(setup_logs + compile_log))
+                archive.writestr("build.log", "\n".join(setup_logs + compile_log))
                 for artifact in artifacts:
                     archive.write(artifact, f"firmware/{artifact.name}")
             encoded = base64.b64encode(memory.getvalue()).decode("ascii")
