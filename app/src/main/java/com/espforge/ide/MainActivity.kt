@@ -770,17 +770,30 @@ private fun runOfflineCompile(activity: MainActivity, board: BoardOption, fqbn: 
                 rm -rf "${'$'}tmp"
               done
               cd '${sketch}'
-              if ! arduino-cli compile --fqbn ''+fqbn+'' --libraries ''+libs+'' --output-dir ''+out+'' . > ''+out+'/build.log' 2>&1; then cat ''+out+'/build.log'; exit 1; fi
-              mkdir -p ''+out+'/package/firmware'
-              find ''+out+'' -maxdepth 1 -type f \\( -name '*.bin' -o -name '*.hex' -o -name '*.uf2' \\) -exec cp {} ''+out+'/package/firmware/' \\;
-              count=$(find ''+out+'/package/firmware' -type f | wc -l)
-              [ "$count" -gt 0 ] || { echo 'No firmware artifacts produced'; exit 2; }
-              printf '{"board":"'+board.id+'","fqbn":"'+fqbn+'"}' > ''+out+'/package/build-manifest.json'
-              cp ''+out+'/build.log' ''+out+'/package/build.log'
-              cd ''+out+'/package'
-              zip -qr ''+out+'/firmware.zip' firmware build-manifest.json build.log
-              rm -rf ''+out+'/package'
-              echo 'Build succeeded. Firmware package: '+out+'/firmware.zip'
+              if ! arduino-cli compile --fqbn '${fqbn}' --libraries '${libs}' --output-dir '${out}' . > '${out}/build.log' 2>&1; then cat '${out}/build.log'; exit 1; fi
+              mkdir -p '${out}/package/firmware'
+              find '${out}' -maxdepth 1 -type f \\( -name '*.bin' -o -name '*.hex' -o -name '*.uf2' \\) -exec cp {} '${out}/package/firmware/' \\;
+              count=${'(find '${out}/package/firmware' -type f | wc -l)
+              [ "@@DOLLAR@@count" -gt 0 ] || { echo 'No firmware artifacts produced'; exit 2; }
+              printf '{"board":"${board.id}","fqbn":"${fqbn}"}' > '${out}/package/build-manifest.json'
+              cp '${out}/build.log' '${out}/package/build.log'
+              cd '${out}/package'
+              zip -qr '${out}/firmware.zip' firmware build-manifest.json build.log
+              rm -rf '${out}/package'
+              echo 'Build succeeded. Firmware package: ${out}/firmware.zip'}(find '${out}/package/firmware' -type f | wc -l)
+              [ "${'count" -gt 0 ] || { echo 'No firmware artifacts produced'; exit 2; }
+              printf '{"board":"${board.id}","fqbn":"${fqbn}"}' > '${out}/package/build-manifest.json'
+              cp '${out}/build.log' '${out}/package/build.log'
+              cd '${out}/package'
+              zip -qr '${out}/firmware.zip' firmware build-manifest.json build.log
+              rm -rf '${out}/package'
+              echo 'Build succeeded. Firmware package: ${out}/firmware.zip'}count" -gt 0 ] || { echo 'No firmware artifacts produced'; exit 2; }
+              printf '{"board":"${board.id}","fqbn":"${fqbn}"}' > '${out}/package/build-manifest.json'
+              cp '${out}/build.log' '${out}/package/build.log'
+              cd '${out}/package'
+              zip -qr '${out}/firmware.zip' firmware build-manifest.json build.log
+              rm -rf '${out}/package'
+              echo 'Build succeeded. Firmware package: ${out}/firmware.zip'
             '
         """.trimIndent()
         val intent = Intent(TERMUX_ACTION).apply {
@@ -814,7 +827,7 @@ private fun runTermuxSetup(activity: MainActivity, board: BoardOption): Boolean 
             if [ ! -d "${'$'}PREFIX/var/lib/proot-distro/installed-rootfs/debian" ]; then proot-distro install debian; fi
             proot-distro login debian -- bash -lc 'set -e
               apt-get update
-              apt-get install -y curl ca-certificates unzip python3
+              apt-get install -y curl ca-certificates unzip zip python3
               arch="${'$'}(dpkg --print-architecture)"
               if [ "${'$'}arch" = "arm64" ]; then asset="Linux_ARM64"; elif [ "${'$'}arch" = "amd64" ]; then asset="Linux_64bit"; else echo "Unsupported Debian architecture: ${'$'}arch"; exit 2; fi
               curl -fsSL "https://downloads.arduino.cc/arduino-cli/arduino-cli_1.5.1_${'$'}{asset}.tar.gz" -o /tmp/arduino-cli.tar.gz
