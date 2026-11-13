@@ -9,7 +9,7 @@ from app.main import CompileRequest, CORE_BY_BOARD, FQBN_BY_BOARD, auto_library_
 def test_supported_board_presets_have_core_and_fqbn():
     assert set(CORE_BY_BOARD) == set(FQBN_BY_BOARD)
     assert FQBN_BY_BOARD["esp32_s3"].endswith(":esp32s3")
-    assert FQBN_BY_BOARD["arduino_uno"] == "arduino:avr:uno"
+    assert FQBN_BY_BOARD["arduino_uno"] == "arduino:avr:uno"\n    assert CORE_BY_BOARD["ch32v003"] == "WCH:ch32v"\n    assert FQBN_BY_BOARD["ch32v003"] == "WCH:ch32v:CH32V00x_EVT"
 
 
 def test_project_rejects_path_traversal():
