@@ -243,7 +243,7 @@ def compile_project(request: CompileRequest, x_api_key: str | None = Header(defa
     ensure_cli_config()
     work = Path(tempfile.mkdtemp(prefix="espforge-"))
     try:
-        sketch = work / "ESPForgeSketch"
+        sketch = work / "main"
         outdir = work / "build"
         libsdir = work / "project-libraries"
         sketch.mkdir()
@@ -259,7 +259,7 @@ def compile_project(request: CompileRequest, x_api_key: str | None = Header(defa
         names = set(request.libraries)
         names.update(auto_library_names(request.files, load_library_index(logs), logs))
         install_libraries(list(names), logs)
-        command = ["compile", "--fqbn", fqbn, "--output-dir", str(outdir), "--libraries", str(libsdir), "--warnings", "all"]
+        command = ["compile", "--fqbn", fqbn, "--output-dir", str(outdir), "--warnings", "all"]
         command.append(str(sketch))
         result = run_cli(command, timeout=MAX_BUILD_SECONDS)
         logs.append(result.stdout)
