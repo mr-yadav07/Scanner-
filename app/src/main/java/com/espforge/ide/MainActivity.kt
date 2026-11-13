@@ -862,8 +862,10 @@ private fun parseHexAddress(value: String): Int {
 }
 
 private fun compileOnline(
+    activity: MainActivity,
     endpoint: String, apiKey: String, board: String, fqbn: String,
-    project: String, projectFiles: Map<String, String>, libraryText: String
+    project: String, projectFiles: Map<String, String>, libraryText: String,
+    onUpdate: (String, Int, String, Boolean) -> Unit
 ): Result<ByteArray> = runCatching {
     require(endpoint.startsWith("https://")) { "Use an HTTPS build API URL in Settings." }
     require(apiKey.isNotBlank()) { "Enter the build API key in Settings." }
@@ -873,32 +875,57 @@ private fun compileOnline(
     libraryText.split(",").map { it.trim() }.filter { it.isNotBlank() }.forEach { libs.put(it) }
     val files = JSONObject(projectFiles)
     val body = JSONObject().put("board", board).put("fqbn", fqbn).put("files", files).put("libraries", libs)
-    val url = URL(endpoint.trimEnd('/') + "/v1/compile")
+    val url = URL(endpoint.trimEnd('/') + "/v1/compile/stream")
     val conn = (url.openConnection() as HttpURLConnection).apply {
         requestMethod = "POST"
         connectTimeout = 20000
         readTimeout = 900000
         doOutput = true
         setRequestProperty("Content-Type", "application/json")
+        setRequestProperty("Accept", "text/event-stream")
         setRequestProperty("X-API-Key", apiKey)
     }
-    conn.outputStream.use { it.write(body.toString().toByteArray(Charsets.UTF_8)) }
-    val code = conn.responseCode
-    if (code !in 200..299) {
-        val error = (conn.errorStream ?: conn.inputStream).bufferedReader().use { it.readText() }
-        throw IllegalStateException("HTTP $code: $error")
+    activity.setActiveBuildConnection(conn)
+    try {
+        conn.outputStream.use { it.write(body.toString().toByteArray(Charsets.UTF_8)) }
+        val code = conn.responseCode
+        if (code !in 200..299) {
+            val error = (conn.errorStream ?: conn.inputStream).bufferedReader().use { it.readText() }
+            throw IllegalStateException("HTTP $code: $error")
+        }
+        var archive: ByteArray? = null
+        conn.inputStream.bufferedReader(Charsets.UTF_8).use { reader ->
+            while (true) {
+                val line = reader.readLine() ?: break
+                if (!line.startsWith("data: ")) continue
+                val event = JSONObject(line.removePrefix("data: "))
+                val type = event.optString("type")
+                val stage = event.optString("stage", "Building")
+                val percent = event.optInt("progress", -1)
+                val message = event.optString("message", "")
+                when (type) {
+                    "progress" -> onUpdate(stage, percent, message, false)
+                    "log" -> onUpdate(stage, percent, message, true)
+                    "heartbeat" -> onUpdate(stage, percent, message, false)
+                    "error" -> throw IllegalStateException(message.ifBlank { "Compiler failed without an error message." })
+                    "complete" -> {
+                        onUpdate(stage, 100, message, false)
+                        val encoded = event.optString("archive_base64")
+                        require(encoded.isNotBlank()) { "Compiler returned no firmware archive." }
+                        archive = Base64.decode(encoded, Base64.DEFAULT)
+                    }
+                }
+            }
+        }
+        val bytes = archive ?: throw IllegalStateException("Build stream ended before a completion event. Check the build service connection.")
+        require(bytes.size >= 4 && bytes[0] == 0x50.toByte() && bytes[1] == 0x4b.toByte()) {
+            "Build server did not return a valid ZIP firmware archive."
+        }
+        bytes
+    } finally {
+        activity.setActiveBuildConnection(null)
+        conn.disconnect()
     }
-    val bytes = conn.inputStream.use { input ->
-        val out = ByteArrayOutputStream()
-        val buffer = ByteArray(8192)
-        while (true) { val n = input.read(buffer); if (n < 0) break; out.write(buffer, 0, n) }
-        out.toByteArray()
-    }
-    require(bytes.size >= 4 && bytes[0] == 0x50.toByte() && bytes[1] == 0x4b.toByte()) {
-        "Build server did not return a ZIP firmware archive."
-    }
-    conn.disconnect()
-    bytes
 }
 
 private fun runOfflineCompile(activity: MainActivity, board: BoardOption, fqbn: String, project: String, projectFiles: Map<String, String>): Boolean {
