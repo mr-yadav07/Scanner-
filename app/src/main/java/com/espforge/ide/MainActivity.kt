@@ -364,7 +364,7 @@ private fun ForgeHome(activity: MainActivity) {
                             require(!entry.name.contains("/") && !entry.name.contains("\\") && !entry.name.startsWith(".")) {
                                 "Project ZIP must contain flat source files only."
                             }
-                            if (entry.name.matches(Regex("[A-Za-z0-9_.-]{1,64}\\\\.(ino|cpp|c|h|hpp)"))) {
+                            if (entry.name.matches(Regex("[A-Za-z0-9_.-]{1,64}\\.(ino|cpp|c|h|hpp)"))) {
                                 imported[entry.name] = String(zip.readBytes(), Charsets.UTF_8)
                             }
                         }
