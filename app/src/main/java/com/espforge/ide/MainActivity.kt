@@ -21,6 +21,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import com.hoho.android.usbserial.driver.UsbSerialDriver
@@ -36,6 +37,7 @@ import dev.espflasher.app.usb.UsbSerialTransport
 import com.espforge.ide.upload.Stk500v1Uploader
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
@@ -76,11 +78,17 @@ class MainActivity : ComponentActivity() {
     private var pendingDriver: UsbSerialDriver? = null
     @Volatile private var readingSerial = false
     private var requestedBaudRate = 115200
+    @Volatile private var activeBuildConnection: HttpURLConnection? = null
+    var offlineBuildRunning by mutableStateOf(false)
+        private set
+    fun setActiveBuildConnection(connection: HttpURLConnection?) { activeBuildConnection = connection }
+    fun cancelOnlineBuild() { activeBuildConnection?.disconnect() }
 
     private val termuxResultReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
             if (intent.action == TermuxResultService.ACTION_TERMUX_RESULT) {
                 offlineBuildOutput = intent.getStringExtra(TermuxResultService.EXTRA_OUTPUT).orEmpty()
+                offlineBuildRunning = false
             }
         }
     }
@@ -112,7 +120,27 @@ class MainActivity : ComponentActivity() {
             @Suppress("DEPRECATION") registerReceiver(usbPermissionReceiver, filter)
             @Suppress("DEPRECATION") registerReceiver(termuxResultReceiver, IntentFilter(TermuxResultService.ACTION_TERMUX_RESULT))
         }
-        setContent { MaterialTheme { ForgeHome(this) } }
+        setContent {
+            val themePrefs = getSharedPreferences("espforge", Context.MODE_PRIVATE)
+            var themeMode by remember { mutableStateOf(themePrefs.getString("themeMode", "Light") ?: "Light") }
+            val colors = when (themeMode) {
+                "Dark" -> darkColorScheme()
+                "AMOLED" -> darkColorScheme(
+                    primary = Color(0xFF90CAF9),
+                    background = Color.Black,
+                    surface = Color.Black,
+                    surfaceVariant = Color(0xFF111111),
+                    onSurface = Color(0xFFECEFF1)
+                )
+                else -> lightColorScheme()
+            }
+            MaterialTheme(colorScheme = colors) {
+                ForgeHome(this, themeMode) { selected ->
+                    themeMode = selected
+                    themePrefs.edit().putString("themeMode", selected).apply()
+                }
+            }
+        }
     }
 
     fun consumeFlashPermission() { flashPermissionResult = null }
@@ -284,7 +312,7 @@ class MainActivity : ComponentActivity() {
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun ForgeHome(activity: MainActivity) {
+private fun ForgeHome(activity: MainActivity, themeMode: String, onThemeChange: (String) -> Unit) {
     val context = LocalContext.current
     val prefs = remember { context.getSharedPreferences("espforge", Context.MODE_PRIVATE) }
     val scope = rememberCoroutineScope()
@@ -299,6 +327,16 @@ private fun ForgeHome(activity: MainActivity) {
         projectFiles = next
         prefs.edit().putString("projectFiles:$project", JSONObject(next).toString()).apply()
     }
+    var removedFiles by remember {
+        mutableStateOf(runCatching {
+            val json = JSONObject(prefs.getString("removedFiles:$project", "{}") ?: "{}")
+            buildMap { json.keys().forEach { key -> put(key, json.getString(key)) } }
+        }.getOrDefault(emptyMap()))
+    }
+    fun saveRemovedFiles(next: Map<String, String>) {
+        removedFiles = next
+        prefs.edit().putString("removedFiles:$project", JSONObject(next).toString()).apply()
+    }
     fun addProjectFile(extension: String) {
         val safeExtension = extension.removePrefix(".").lowercase()
         val number = (1..99).firstOrNull { "File$it.$safeExtension" !in projectFiles } ?: return
@@ -312,6 +350,15 @@ private fun ForgeHome(activity: MainActivity) {
     var output by remember { mutableStateOf("Ready. Configure the online build API or prepare the offline Termux toolchain.") }
     var tab by remember { mutableStateOf("Editor") }
     var busy by remember { mutableStateOf(false) }
+    var buildProgress by remember { mutableStateOf(0) }
+    var buildStage by remember { mutableStateOf("Idle") }
+    var buildLog by remember { mutableStateOf("") }
+    var buildStartedAt by remember { mutableStateOf(0L) }
+    var buildElapsed by remember { mutableStateOf(0L) }
+    var cancelRequested by remember { mutableStateOf(false) }
+    var renameTarget by remember { mutableStateOf<String?>(null) }
+    var renameValue by remember { mutableStateOf("") }
+    var deleteTarget by remember { mutableStateOf<String?>(null) }
     var pendingZip by remember { mutableStateOf<ByteArray?>(null) }
     var pendingExport by remember { mutableStateOf<File?>(null) }
     var libraryFiles by remember { mutableStateOf(listOf<File>()) }
