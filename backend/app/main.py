@@ -2,12 +2,11 @@ from __future__ import annotations
 
 import base64
 import hashlib
-import os
-import selectors
-import time
 import io
 import json
 import os
+import selectors
+import time
 import re
 import shutil
 import subprocess
@@ -364,7 +363,7 @@ def compile_project_stream(request: CompileRequest, x_api_key: str | None = Head
                 yield send("progress", stage="Libraries ready", progress=48, message="No additional libraries required.")
 
             command = [CLI, "--config-file", str(CONFIG_FILE), "compile", "--fqbn", fqbn,
-                       "--output-dir", str(outdir), "--warnings", "all"]
+                       "--output-dir", str(outdir), "--warnings", "all", "--verbose"]
             for option in DEFAULT_BOARD_OPTIONS.get(board, []):
                 command.extend(["--board-options", option])
             command.append(str(sketch))
