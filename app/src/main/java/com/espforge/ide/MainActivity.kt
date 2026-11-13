@@ -361,7 +361,7 @@ private fun ForgeHome(activity: MainActivity) {
                     var entry = zip.nextEntry
                     while (entry != null) {
                         if (!entry.isDirectory && entry.name != "espforge-project.json") {
-                            require(!entry.name.contains("/") && !entry.name.contains("\\\\") && !entry.name.startsWith(".")) {
+                            require(!entry.name.contains("/") && !entry.name.contains("\\") && !entry.name.startsWith(".")) {
                                 "Project ZIP must contain flat source files only."
                             }
                             if (entry.name.matches(Regex("[A-Za-z0-9_.-]{1,64}\\\\.(ino|cpp|c|h|hpp)"))) {
