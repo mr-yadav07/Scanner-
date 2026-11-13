@@ -55,7 +55,10 @@ FQBN_BY_BOARD = {
     "stm32_bluepill": "STMicroelectronics:stm32:GenF1",
     "ch32v003": "WCH:ch32v:CH32V00x_EVT",
 }
-DEFAULT_BOARD_OPTIONS = {\n    "ch32v003": ["pnum=CH32V003F4"],\n}\nCORE_HEADERS = {
+DEFAULT_BOARD_OPTIONS = {
+    "ch32v003": ["pnum=CH32V003F4"],
+}
+CORE_HEADERS = {
     "Arduino.h", "WiFi.h", "ESP8266WiFi.h", "EEPROM.h", "SPI.h", "Wire.h",
     "Preferences.h", "HardwareSerial.h", "stdint.h", "stdbool.h", "math.h",
     "string", "vector", "algorithm", "array", "functional", "memory"
@@ -259,7 +262,9 @@ def compile_project(request: CompileRequest, x_api_key: str | None = Header(defa
         names = set(request.libraries)
         names.update(auto_library_names(request.files, load_library_index(logs), logs))
         install_libraries(list(names), logs)
-        command = ["compile", "--fqbn", fqbn, "--output-dir", str(outdir), "--warnings", "all"]\n        for option in DEFAULT_BOARD_OPTIONS.get(board, []):\n            command.extend(["--board-options", option])
+        command = ["compile", "--fqbn", fqbn, "--output-dir", str(outdir), "--warnings", "all"]
+        for option in DEFAULT_BOARD_OPTIONS.get(board, []):
+            command.extend(["--board-options", option])
         command.append(str(sketch))
         result = run_cli(command, timeout=MAX_BUILD_SECONDS)
         logs.append(result.stdout)
