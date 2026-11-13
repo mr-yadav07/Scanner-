@@ -32,6 +32,7 @@ import dev.espflasher.app.domain.FlashProgress
 import dev.espflasher.app.flash.Esp32Flasher
 import dev.espflasher.app.flash.Esp8266Flasher
 import dev.espflasher.app.usb.UsbSerialTransport
+import com.espforge.ide.upload.Stk500v1Uploader
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -143,6 +144,40 @@ class MainActivity : ComponentActivity() {
             "Flash and MD5 verification succeeded. Detected: ${detected.description}, flash: ${detected.flashSizeLabel}."
         } finally {
             flasher.disconnect()
+        }
+    }
+
+    suspend fun flashAvrFirmware(
+        device: UsbDevice,
+        boardId: String,
+        hexText: String,
+        onProgress: (Float) -> Unit
+    ): String = withContext(Dispatchers.IO) {
+        require(boardId == "arduino_uno" || boardId == "arduino_nano") { "AVR uploader supports Uno and Nano only." }
+        require(hexText.isNotBlank()) { "Intel HEX firmware is empty." }
+        closeSerial()
+        val manager = getSystemService(USB_SERVICE) as UsbManager
+        val transport = UsbSerialTransport(manager, device, UsbSerialTransport.labelFor(device))
+        Stk500v1Uploader(transport).upload(
+            hexText,
+            nanoOldBootloader = boardId == "arduino_nano",
+            onProgress = onProgress
+        )
+    }
+
+    suspend fun flashFirmware(
+        device: UsbDevice,
+        boardId: String,
+        images: List<FirmwareImage>,
+        onProgress: (Float) -> Unit
+    ): String {
+        return when (boardId) {
+            "arduino_uno", "arduino_nano" -> {
+                val hexImage = images.firstOrNull { it.name.endsWith(".hex", true) }
+                    ?: throw IllegalArgumentException("Choose an AVR .hex output generated for Uno/Nano.")
+                flashAvrFirmware(device, boardId, String(hexImage.bytes, Charsets.UTF_8), onProgress)
+            }
+            else -> flashEspFirmware(device, boardId, images, onProgress)
         }
     }
 
@@ -406,7 +441,7 @@ private fun ForgeHome(activity: MainActivity) {
                     }
                     if (flashProgress > 0f && flashProgress < 100f) LinearProgressIndicator(progress = { flashProgress / 100f }, modifier = Modifier.fillMaxWidth())
                     Button(
-                        enabled = !busy && selectedUsb != null && firmwareImages.isNotEmpty() && board.id in listOf("esp8266", "esp32", "esp32_s3"),
+                        enabled = !busy && selectedUsb != null && firmwareImages.isNotEmpty() && board.id in listOf("arduino_uno", "arduino_nano", "esp8266", "esp32", "esp32_s3"),
                         onClick = {
                             val dev = selectedUsb
                             if (dev == null) output = "Connect the board through a USB OTG adapter first."
@@ -415,7 +450,7 @@ private fun ForgeHome(activity: MainActivity) {
                         },
                         modifier = Modifier.fillMaxWidth()
                     ) { Text(if (busy) "Flashing…" else "Flash + verify") }
-                    Text("Direct USB flashing is currently implemented for ESP8266, ESP32 and ESP32-S3. AVR, STM32 and CH32 compile targets are included; their native Android upload protocols still need implementation.")
+                    Text("Direct USB flashing is implemented for ESP8266/ESP32 variants and ATmega328P Uno/Nano. STM32 and CH32 compile targets are included; their native upload protocols still need implementation.")
                     LaunchedEffect(activity.flashPermissionResult) {
                         val result = activity.flashPermissionResult
                         if (result != null) {
@@ -427,7 +462,7 @@ private fun ForgeHome(activity: MainActivity) {
                                 flashProgress = 0f
                                 output = "Entering ROM bootloader and flashing firmware…"
                                 val attempt = runCatching {
-                                    activity.flashEspFirmware(result.device, board.id, firmwareImages) { progress ->
+                                    activity.flashFirmware(result.device, board.id, firmwareImages) { progress ->
                                         activity.runOnUiThread { flashProgress = progress.percent }
                                     }
                                 }
@@ -485,7 +520,7 @@ private fun readFirmwareImages(context: Context, uri: Uri, boardId: String, rawA
         ZipInputStream(ByteArrayInputStream(bytes)).use { zip ->
             var entry = zip.nextEntry
             while (entry != null) {
-                if (!entry.isDirectory && entry.name.startsWith("firmware/") && entry.name.endsWith(".bin", true)) {
+                if (!entry.isDirectory && entry.name.startsWith("firmware/") && (entry.name.endsWith(".bin", true) || entry.name.endsWith(".hex", true))) {
                     entries += entry.name.substringAfterLast('/') to zip.readBytes()
                 }
                 zip.closeEntry()
@@ -496,13 +531,14 @@ private fun readFirmwareImages(context: Context, uri: Uri, boardId: String, rawA
         return entries.sortedBy { firmwareAddress(it.first, boardId) }
             .map { (name, data) -> FirmwareImage(name, data, firmwareAddress(name, boardId)) }
     }
-    if (!displayName.endsWith(".bin", true)) throw IllegalArgumentException("Choose a firmware ZIP or raw .bin file.")
-    return listOf(FirmwareImage(displayName, bytes, parseHexAddress(rawAddress)))
+    if (!(displayName.endsWith(".bin", true) || displayName.endsWith(".hex", true))) throw IllegalArgumentException("Choose a firmware ZIP, raw .bin or Intel HEX file.")
+    return listOf(FirmwareImage(displayName, bytes, if (displayName.endsWith(".hex", true)) 0 else parseHexAddress(rawAddress)))
 }
 
 private fun firmwareAddress(name: String, boardId: String): Int {
     val n = name.lowercase()
     return when {
+        boardId == "arduino_uno" || boardId == "arduino_nano" -> 0
         "merged" in n || "combined" in n -> 0
         boardId == "esp8266" -> 0
         "bootloader" in n -> 0x1000
