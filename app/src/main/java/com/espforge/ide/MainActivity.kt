@@ -710,7 +710,7 @@ private fun compileOnline(
     val libs = JSONArray()
     libraryText.split(",").map { it.trim() }.filter { it.isNotBlank() }.forEach { libs.put(it) }
     val files = JSONObject(projectFiles)
-    val body = JSONObject().put("board", board).put("fqbn", fqbn).put("files", files).put("libraries", libs).put("board_options", JSONObject().put("pnum", "CH32V003F4"))
+    val body = JSONObject().put("board", board).put("fqbn", fqbn).put("files", files).put("libraries", libs)
     val url = URL(endpoint.trimEnd('/') + "/v1/compile")
     val conn = (url.openConnection() as HttpURLConnection).apply {
         requestMethod = "POST"
@@ -752,6 +752,7 @@ private fun runOfflineCompile(activity: MainActivity, board: BoardOption, fqbn: 
             val encoded = Base64.encodeToString(text.toByteArray(Charsets.UTF_8), Base64.NO_WRAP)
             "printf '%s' '$encoded' | base64 -d > '$sketch/$name'"
         }
+        val boardOption = when (board.id) { "stm32_bluepill" -> "--board-options pnum=BLUEPILL_F103C8"; "ch32v003" -> "--board-options pnum=CH32V003F4"; else -> "" }
         val script = """
             set -e
             mkdir -p '$sketch' '$libs' '$out'
@@ -770,7 +771,7 @@ private fun runOfflineCompile(activity: MainActivity, board: BoardOption, fqbn: 
                 rm -rf "${'$'}tmp"
               done
               cd '${sketch}'
-              if ! arduino-cli compile --fqbn '${fqbn}' --libraries '${libs}' --output-dir '${out}' . > '${out}/build.log' 2>&1; then cat '${out}/build.log'; exit 1; fi
+              if ! arduino-cli compile --fqbn '${fqbn}' ${boardOption} --libraries '${libs}' --output-dir '${out}' . > '${out}/build.log' 2>&1; then cat '${out}/build.log'; exit 1; fi
               mkdir -p '${out}/package/firmware'
               find '${out}' -maxdepth 1 -type f \( -name '*.bin' -o -name '*.hex' -o -name '*.uf2' \) -exec cp {} '${out}/package/firmware/' \;
               count=${'$'}(find '${out}/package/firmware' -type f | wc -l)
