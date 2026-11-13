@@ -17,7 +17,7 @@ Configure the Android app's Online Build URL as `https://YOUR_HOST` and enter th
 - `GET /v1/boards`
 - `POST /v1/compile` with `X-API-Key` and JSON body: `board`, optional exact `fqbn`, a `files` map and optional explicit library package names.
 
-The result is an `application/zip` containing `firmware/*`, `build-manifest.json`, and `build.log`.
+The uploaded sketch is compiled from a `main/main.ino` sketch folder. The result is an `application/zip` containing `firmware/*`, `build-manifest.json`, and `build.log`.
 
 ## Supported presets
 
