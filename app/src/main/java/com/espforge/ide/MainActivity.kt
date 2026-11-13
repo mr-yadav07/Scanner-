@@ -79,8 +79,6 @@ class MainActivity : ComponentActivity() {
     @Volatile private var readingSerial = false
     private var requestedBaudRate = 115200
     @Volatile private var activeBuildConnection: HttpURLConnection? = null
-    var offlineBuildRunning by mutableStateOf(false)
-        private set
     fun setActiveBuildConnection(connection: HttpURLConnection?) { activeBuildConnection = connection }
     fun cancelOnlineBuild() { activeBuildConnection?.disconnect() }
 
@@ -88,7 +86,6 @@ class MainActivity : ComponentActivity() {
         override fun onReceive(context: Context, intent: Intent) {
             if (intent.action == TermuxResultService.ACTION_TERMUX_RESULT) {
                 offlineBuildOutput = intent.getStringExtra(TermuxResultService.EXTRA_OUTPUT).orEmpty()
-                offlineBuildRunning = false
             }
         }
     }
@@ -629,7 +626,6 @@ private fun ForgeHome(activity: MainActivity, themeMode: String, onThemeChange: 
                             output = "Starting local Arduino CLI build in Termux. Live output will appear below."
                             val success = if (board.id == "ch32v003") false else runOfflineCompile(activity, board, fqbn, project, projectFiles)
                             if (success) {
-                                activity.offlineBuildRunning = true
                                 buildStage = "Waiting for Termux"
                                 buildLog = "Termux accepted the build command. Waiting for compiler output…"
                                 buildProgress = 5
@@ -790,6 +786,46 @@ private fun ForgeHome(activity: MainActivity, themeMode: String, onThemeChange: 
             Text("Build log", style = MaterialTheme.typography.titleMedium)
             Surface(color = MaterialTheme.colorScheme.surfaceVariant, modifier = Modifier.fillMaxWidth()) {
                 Text(output, modifier = Modifier.padding(12.dp), style = MaterialTheme.typography.bodySmall)
+            }
+            renameTarget?.let { target ->
+                AlertDialog(
+                    onDismissRequest = { renameTarget = null },
+                    title = { Text("Rename project file") },
+                    text = {
+                        OutlinedTextField(renameValue, { renameValue = it }, label = { Text("New filename") }, singleLine = true)
+                    },
+                    confirmButton = {
+                        TextButton(onClick = {
+                            val nextName = renameValue.trim()
+                            if (nextName.matches(Regex("[A-Za-z0-9_.-]{1,64}\\.(ino|cpp|c|h|hpp)")) &&
+                                nextName !in projectFiles && target != "main.ino") {
+                                val next = linkedMapOf<String, String>()
+                                projectFiles.forEach { (name, code) -> next[if (name == target) nextName else name] = code }
+                                saveFiles(next)
+                                activeFileName = nextName
+                                renameTarget = null
+                            } else {
+                                output = "Invalid filename or a file with that name already exists."
+                            }
+                        }) { Text("Rename") }
+                    },
+                    dismissButton = { TextButton(onClick = { renameTarget = null }) { Text("Cancel") } }
+                )
+            }
+            deleteTarget?.let { target ->
+                AlertDialog(
+                    onDismissRequest = { deleteTarget = null },
+                    title = { Text("Delete $target permanently?") },
+                    text = { Text("This removes the file and its source from this project. Use Remove instead if you may want to restore it later.") },
+                    confirmButton = {
+                        TextButton(onClick = {
+                            saveFiles(projectFiles - target)
+                            activeFileName = projectFiles.keys.firstOrNull { it != target } ?: "main.ino"
+                            deleteTarget = null
+                        }) { Text("Delete") }
+                    },
+                    dismissButton = { TextButton(onClick = { deleteTarget = null }) { Text("Cancel") } }
+                )
             }
         }
     }
