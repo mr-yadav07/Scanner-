@@ -68,10 +68,20 @@ class MainActivity : ComponentActivity() {
         private set
     var serialText by mutableStateOf("")
         private set
+    var offlineBuildOutput by mutableStateOf("")
+        private set
     internal var flashPermissionResult by mutableStateOf<FlashPermissionResult?>(null)
     private var serialPort: UsbSerialPort? = null
     private var pendingDriver: UsbSerialDriver? = null
     @Volatile private var readingSerial = false
+
+    private val termuxResultReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            if (intent.action == TermuxResultService.ACTION_TERMUX_RESULT) {
+                offlineBuildOutput = intent.getStringExtra(TermuxResultService.EXTRA_OUTPUT).orEmpty()
+            }
+        }
+    }
 
     private val usbPermissionReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
@@ -93,8 +103,13 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         val filter = IntentFilter().apply { addAction(USB_PERMISSION_ACTION); addAction(FLASH_USB_PERMISSION_ACTION) }
-        if (Build.VERSION.SDK_INT >= 33) registerReceiver(usbPermissionReceiver, filter, RECEIVER_NOT_EXPORTED)
-        else @Suppress("DEPRECATION") registerReceiver(usbPermissionReceiver, filter)
+        if (Build.VERSION.SDK_INT >= 33) {
+            registerReceiver(usbPermissionReceiver, filter, RECEIVER_NOT_EXPORTED)
+            registerReceiver(termuxResultReceiver, IntentFilter(TermuxResultService.ACTION_TERMUX_RESULT), RECEIVER_NOT_EXPORTED)
+        } else {
+            @Suppress("DEPRECATION") registerReceiver(usbPermissionReceiver, filter)
+            @Suppress("DEPRECATION") registerReceiver(termuxResultReceiver, IntentFilter(TermuxResultService.ACTION_TERMUX_RESULT))
+        }
         setContent { MaterialTheme { ForgeHome(this) } }
     }
 
@@ -259,6 +274,7 @@ class MainActivity : ComponentActivity() {
     override fun onDestroy() {
         closeSerial()
         try { unregisterReceiver(usbPermissionReceiver) } catch (_: Exception) {}
+        try { unregisterReceiver(termuxResultReceiver) } catch (_: Exception) {}
         super.onDestroy()
     }
 }
@@ -340,6 +356,9 @@ private fun ForgeHome(activity: MainActivity) {
     }
 
     LaunchedEffect(Unit) { refreshLibraries(); refreshUsbDevices() }
+    LaunchedEffect(activity.offlineBuildOutput) {
+        if (activity.offlineBuildOutput.isNotBlank()) output = activity.offlineBuildOutput
+    }
 
     Scaffold(topBar = { TopAppBar(title = { Text("ESP Forge IDE") }, actions = {
         Text(if (busy) "BUILDING" else "v0.2", style = MaterialTheme.typography.labelMedium, modifier = Modifier.padding(end = 12.dp))
@@ -607,7 +626,7 @@ private fun runOfflineCompile(activity: MainActivity, board: BoardOption, fqbn: 
             set -e
             mkdir -p '$sketch' '$libs' '$out'
             cat > '$sketch/main.ino'
-            proot-distro login debian --bind /storage:/storage -- bash -lc 'set -e
+            proot-distro login --bind /storage:/storage debian -- bash -lc 'set -e
               mkdir -p '${libs}' '${out}'
               for z in '${zipFolder}'/*.zip; do
                 [ -f "${'$'}z" ] || continue
@@ -633,6 +652,13 @@ private fun runOfflineCompile(activity: MainActivity, board: BoardOption, fqbn: 
             putExtra("com.termux.RUN_COMMAND_WORKDIR", "${'$'}HOME")
             putExtra("com.termux.RUN_COMMAND_LABEL", "ESP Forge offline compile")
         }
+        val callback = PendingIntent.getService(
+            activity,
+            (System.currentTimeMillis() and 0x7FFFFFFF).toInt(),
+            Intent(activity, TermuxResultService::class.java),
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_MUTABLE
+        )
+        intent.putExtra("com.termux.RUN_COMMAND_PENDING_INTENT", callback)
         activity.startService(intent)
         true
     }.getOrElse { false }
