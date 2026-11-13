@@ -35,7 +35,7 @@ ADDITIONAL_URLS = [
     "https://espressif.github.io/arduino-esp32/package_esp32_index.json",
     "https://arduino.esp8266.com/stable/package_esp8266com_index.json",
     "https://github.com/stm32duino/BoardManagerFiles/raw/main/package_stmicroelectronics_index.json",
-    "https://raw.githubusercontent.com/ch32-riscv-ug/arduino_core_ch32_riscv_noneos/main/package_ch32-riscv-noneos.json",
+    "https://raw.githubusercontent.com/ch32-riscv-ug/arduino_core_ch32_riscv_arduino/main/package_ch32-riscv-arduino.json",
 ]
 CORE_BY_BOARD = {
     "arduino_uno": "arduino:avr",
@@ -44,7 +44,7 @@ CORE_BY_BOARD = {
     "esp32_s3": "esp32:esp32",
     "esp8266": "esp8266:esp8266",
     "stm32_bluepill": "STMicroelectronics:stm32",
-    "ch32v003": "ch32-riscv-noneos:ch32riscv",
+    "ch32v003": "ch32-riscv-arduino:ch32riscv",
 }
 FQBN_BY_BOARD = {
     "arduino_uno": "arduino:avr:uno",
@@ -53,7 +53,7 @@ FQBN_BY_BOARD = {
     "esp32_s3": "esp32:esp32:esp32s3",
     "esp8266": "esp8266:esp8266:nodemcuv2",
     "stm32_bluepill": "STMicroelectronics:stm32:GenF1",
-    "ch32v003": "ch32-riscv-noneos:ch32riscv:CH32V003",
+    "ch32v003": "ch32-riscv-arduino:ch32riscv:CH32V003",
 }
 CORE_HEADERS = {
     "Arduino.h", "WiFi.h", "ESP8266WiFi.h", "EEPROM.h", "SPI.h", "Wire.h",
