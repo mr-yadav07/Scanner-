@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import base64
 import hashlib
+import os
+import selectors
+import time
 import io
 import json
 import os
@@ -294,3 +298,159 @@ def compile_project(request: CompileRequest, x_api_key: str | None = Header(defa
         raise HTTPException(status_code=422, detail=str(exc))
     finally:
         shutil.rmtree(work, ignore_errors=True)
+
+
+
+@app.post("/v1/compile/stream")
+def compile_project_stream(request: CompileRequest, x_api_key: str | None = Header(default=None)):
+    """Stream truthful build stages and compiler output as newline-delimited SSE data."""
+    if not API_KEY:
+        raise HTTPException(status_code=503, detail="Build service is not configured. Set API_KEY before exposing it.")
+    if x_api_key != API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid build API key.")
+    board = request.board.lower()
+    if board not in CORE_BY_BOARD:
+        raise HTTPException(status_code=400, detail=f"Unsupported board preset: {board}")
+    fqbn = request.fqbn or FQBN_BY_BOARD[board]
+    if not fqbn.startswith(CORE_BY_BOARD[board] + ":") or not re.fullmatch(r"[A-Za-z0-9_.:-]+", fqbn):
+        raise HTTPException(status_code=400, detail="FQBN does not match the selected board family.")
+
+    def stream():
+        work = Path(tempfile.mkdtemp(prefix="espforge-stream-"))
+        process = None
+        started = time.monotonic()
+
+        def send(kind: str, **payload):
+            return "data: " + json.dumps({"type": kind, **payload}, ensure_ascii=False) + "\\n\\n"
+
+        try:
+            yield send("progress", stage="Preparing project", progress=3, message="Validating source files and preparing workspace.")
+            ensure_cli_config()
+            sketch = work / "main"
+            outdir = work / "build"
+            sketch.mkdir()
+            outdir.mkdir()
+            for name, content in request.files.items():
+                dest = (sketch / name).resolve()
+                if sketch.resolve() not in dest.parents:
+                    raise RuntimeError(f"Invalid project path: {name}")
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                dest.write_text(content, encoding="utf-8")
+
+            yield send("progress", stage="Board toolchain", progress=10, message=f"Checking/installing {CORE_BY_BOARD[board]}.")
+            setup_logs: List[str] = []
+            ensure_core(CORE_BY_BOARD[board], setup_logs)
+            for item in setup_logs:
+                for line in item.splitlines():
+                    if line.strip():
+                        yield send("log", stage="Board toolchain", message=line)
+
+            yield send("progress", stage="Resolving libraries", progress=30, message="Resolving Arduino Library Manager dependencies.")
+            names = set(request.libraries)
+            names.update(auto_library_names(request.files, load_library_index(setup_logs), setup_logs))
+            for item in setup_logs:
+                for line in item.splitlines():
+                    if line.strip():
+                        yield send("log", stage="Library resolution", message=line)
+            if names:
+                yield send("progress", stage="Installing libraries", progress=42, message="Installing: " + ", ".join(sorted(names)))
+                install_logs: List[str] = []
+                install_libraries(list(names), install_logs)
+                for item in install_logs:
+                    for line in item.splitlines():
+                        if line.strip():
+                            yield send("log", stage="Library installation", message=line)
+            else:
+                yield send("progress", stage="Libraries ready", progress=48, message="No additional libraries required.")
+
+            command = [CLI, "--config-file", str(CONFIG_FILE), "compile", "--fqbn", fqbn,
+                       "--output-dir", str(outdir), "--warnings", "all"]
+            for option in DEFAULT_BOARD_OPTIONS.get(board, []):
+                command.extend(["--board-options", option])
+            command.append(str(sketch))
+            yield send("progress", stage="Compiling", progress=55,
+                       message="Arduino CLI compiler started. The percentage is stage-based; Arduino CLI does not expose a reliable compile percentage.")
+            process = subprocess.Popen(
+                command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=False, bufsize=0, env=os.environ.copy()
+            )
+            selector = selectors.DefaultSelector()
+            assert process.stdout is not None
+            selector.register(process.stdout, selectors.EVENT_READ)
+            pending = b""
+            compile_log: List[str] = []
+            deadline = time.monotonic() + MAX_BUILD_SECONDS
+            last_heartbeat = time.monotonic()
+            while True:
+                if time.monotonic() > deadline:
+                    process.kill()
+                    raise TimeoutError("Build timed out after 15 minutes.")
+                ready = selector.select(timeout=1.0)
+                if ready:
+                    chunk = os.read(process.stdout.fileno(), 4096)
+                    if not chunk:
+                        break
+                    pending += chunk
+                    while b"\\n" in pending:
+                        raw, pending = pending.split(b"\\n", 1)
+                        line = raw.decode("utf-8", errors="replace").rstrip("\\r")
+                        if line:
+                            compile_log.append(line)
+                            yield send("log", stage="Compiling", message=line)
+                elif process.poll() is not None:
+                    tail = process.stdout.read() or b""
+                    pending += tail
+                    break
+                elif time.monotonic() - last_heartbeat >= 5:
+                    yield send("heartbeat", stage="Compiling", message="Compiler is still running; waiting for the next compiler output.")
+                    last_heartbeat = time.monotonic()
+            if pending.strip():
+                line = pending.decode("utf-8", errors="replace").rstrip("\\r")
+                compile_log.append(line)
+                yield send("log", stage="Compiling", message=line)
+            return_code = process.wait(timeout=5)
+            selector.close()
+            process = None
+            if return_code:
+                raise RuntimeError("Compilation failed (exit code " + str(return_code) + "):\\n" + "\\n".join(compile_log[-400:]))
+
+            yield send("progress", stage="Packaging firmware", progress=92, message="Compilation succeeded. Collecting firmware artifacts.")
+            artifacts = [p for p in outdir.rglob("*") if p.is_file() and p.suffix.lower() in {".bin", ".hex", ".elf", ".eep", ".uf2"}]
+            if not artifacts:
+                raise RuntimeError("Compiler reported success but produced no firmware artifact.")
+            manifest = {
+                "board": board, "fqbn": fqbn,
+                "duration_seconds": round(time.monotonic() - started, 2),
+                "artifacts": [{"name": p.name, "size": p.stat().st_size,
+                               "sha256": hashlib.sha256(p.read_bytes()).hexdigest()} for p in artifacts],
+            }
+            memory = io.BytesIO()
+            with zipfile.ZipFile(memory, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+                archive.writestr("build-manifest.json", json.dumps(manifest, indent=2))
+                archive.writestr("build.log", "\\n".join(setup_logs + compile_log))
+                for artifact in artifacts:
+                    archive.write(artifact, f"firmware/{artifact.name}")
+            encoded = base64.b64encode(memory.getvalue()).decode("ascii")
+            yield send("complete", progress=100, stage="Build succeeded",
+                       message=f"Build completed in {manifest['duration_seconds']} seconds.",
+                       archive_base64=encoded, artifacts=manifest["artifacts"],
+                       duration_seconds=manifest["duration_seconds"])
+        except GeneratorExit:
+            raise
+        except Exception as exc:
+            if isinstance(exc, TimeoutError) and process is not None:
+                process.kill()
+            yield send("error", stage="Build failed", message=str(exc))
+        finally:
+            if process is not None and process.poll() is None:
+                process.kill()
+                try:
+                    process.wait(timeout=3)
+                except Exception:
+                    pass
+            shutil.rmtree(work, ignore_errors=True)
+
+    return StreamingResponse(
+        stream(), media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
+    )
