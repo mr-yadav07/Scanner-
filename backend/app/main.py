@@ -35,7 +35,7 @@ ADDITIONAL_URLS = [
     "https://espressif.github.io/arduino-esp32/package_esp32_index.json",
     "https://arduino.esp8266.com/stable/package_esp8266com_index.json",
     "https://github.com/stm32duino/BoardManagerFiles/raw/main/package_stmicroelectronics_index.json",
-    "https://raw.githubusercontent.com/ch32-riscv-ug/arduino_core_ch32_riscv_arduino/main/package_ch32-riscv-arduino.json",
+    "https://github.com/openwch/board_manager_files/raw/main/package_ch32v_index.json",
 ]
 CORE_BY_BOARD = {
     "arduino_uno": "arduino:avr",
@@ -44,7 +44,7 @@ CORE_BY_BOARD = {
     "esp32_s3": "esp32:esp32",
     "esp8266": "esp8266:esp8266",
     "stm32_bluepill": "STMicroelectronics:stm32",
-    "ch32v003": "ch32-riscv-arduino:ch32riscv",
+    "ch32v003": "WCH:ch32v",
 }
 FQBN_BY_BOARD = {
     "arduino_uno": "arduino:avr:uno",
@@ -53,9 +53,9 @@ FQBN_BY_BOARD = {
     "esp32_s3": "esp32:esp32:esp32s3",
     "esp8266": "esp8266:esp8266:nodemcuv2",
     "stm32_bluepill": "STMicroelectronics:stm32:GenF1",
-    "ch32v003": "ch32-riscv-arduino:ch32riscv:CH32V003",
+    "ch32v003": "WCH:ch32v:CH32V00x_EVT",
 }
-CORE_HEADERS = {
+DEFAULT_BOARD_OPTIONS = {\n    "ch32v003": ["pnum=CH32V003F4"],\n}\nCORE_HEADERS = {
     "Arduino.h", "WiFi.h", "ESP8266WiFi.h", "EEPROM.h", "SPI.h", "Wire.h",
     "Preferences.h", "HardwareSerial.h", "stdint.h", "stdbool.h", "math.h",
     "string", "vector", "algorithm", "array", "functional", "memory"
@@ -259,7 +259,7 @@ def compile_project(request: CompileRequest, x_api_key: str | None = Header(defa
         names = set(request.libraries)
         names.update(auto_library_names(request.files, load_library_index(logs), logs))
         install_libraries(list(names), logs)
-        command = ["compile", "--fqbn", fqbn, "--output-dir", str(outdir), "--warnings", "all"]
+        command = ["compile", "--fqbn", fqbn, "--output-dir", str(outdir), "--warnings", "all"]\n        for option in DEFAULT_BOARD_OPTIONS.get(board, []):\n            command.extend(["--board-options", option])
         command.append(str(sketch))
         result = run_cli(command, timeout=MAX_BUILD_SECONDS)
         logs.append(result.stdout)
