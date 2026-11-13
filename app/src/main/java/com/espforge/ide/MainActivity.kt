@@ -650,7 +650,7 @@ private fun ForgeHome(activity: MainActivity, themeMode: String, onThemeChange: 
                             progress = { buildProgress.coerceIn(0, 100) / 100f },
                             modifier = Modifier.fillMaxWidth()
                         )
-                        Text("$buildProgress% · $buildElapsed s elapsed", style = MaterialTheme.typography.bodySmall)
+                        Text("$buildProgress% · stage estimate (not exact compiler %) · $buildElapsed s elapsed", style = MaterialTheme.typography.bodySmall)
                         Surface(color = MaterialTheme.colorScheme.surfaceVariant, modifier = Modifier.fillMaxWidth()) {
                             Text(buildLog.ifBlank { "Waiting for compiler output…" },
                                 modifier = Modifier.padding(10.dp).heightIn(min = 80.dp, max = 260.dp).verticalScroll(rememberScrollState()),
