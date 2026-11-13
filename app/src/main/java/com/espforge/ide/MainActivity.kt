@@ -1,80 +1,476 @@
 package com.espforge.ide
 
+import android.app.PendingIntent
+import android.content.*
+import android.hardware.usb.UsbManager
+import android.net.Uri
+import android.os.Build
 import android.os.Bundle
+import android.os.Environment
+import android.provider.MediaStore
+import android.content.ContentValues
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
+import com.hoho.android.usbserial.driver.UsbSerialDriver
+import com.hoho.android.usbserial.driver.UsbSerialPort
+import com.hoho.android.usbserial.driver.UsbSerialProber
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import org.json.JSONArray
+import org.json.JSONObject
+import java.io.ByteArrayOutputStream
+import java.io.File
+import java.net.HttpURLConnection
+import java.net.URL
+import java.util.zip.ZipInputStream
 
-private val boards = listOf("ESP32", "ESP32-S3", "ESP8266", "Arduino Uno", "Arduino Nano", "CH32", "STM32")
+private const val USB_PERMISSION_ACTION = "com.espforge.ide.USB_PERMISSION"
+private const val TERMUX_ACTION = "com.termux.RUN_COMMAND"
+private const val WORKSPACE = "/storage/emulated/0/Documents/ESPForge"
+private const val LIBRARY_ZIPS = "$WORKSPACE/LibraryZips"
+
+private data class BoardOption(val id: String, val label: String, val fqbn: String, val core: String)
+private val boards = listOf(
+    BoardOption("arduino_uno", "Arduino Uno", "arduino:avr:uno", "arduino:avr"),
+    BoardOption("arduino_nano", "Arduino Nano", "arduino:avr:nano", "arduino:avr"),
+    BoardOption("esp32", "ESP32 Dev Module", "esp32:esp32:esp32", "esp32:esp32"),
+    BoardOption("esp32_s3", "ESP32-S3 Dev Module", "esp32:esp32:esp32s3", "esp32:esp32"),
+    BoardOption("esp8266", "ESP8266 NodeMCU", "esp8266:esp8266:nodemcuv2", "esp8266:esp8266"),
+    BoardOption("stm32_bluepill", "STM32 Blue Pill (F1)", "STMicroelectronics:stm32:GenF1", "STMicroelectronics:stm32"),
+    BoardOption("ch32v003", "WCH CH32V003", "ch32-riscv-ug:CH32RV:CH32V003", "ch32-riscv-ug:CH32RV")
+)
 
 class MainActivity : ComponentActivity() {
+    var serialStatus by mutableStateOf("USB disconnected")
+        private set
+    var serialText by mutableStateOf("")
+        private set
+    private var serialPort: UsbSerialPort? = null
+    private var pendingDriver: UsbSerialDriver? = null
+    @Volatile private var readingSerial = false
+
+    private val usbPermissionReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            if (intent.action != USB_PERMISSION_ACTION) return
+            val device = intent.getParcelableExtra<android.hardware.usb.UsbDevice>(UsbManager.EXTRA_DEVICE)
+            if (intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false) && device != null) {
+                pendingDriver?.takeIf { it.device.deviceId == device.deviceId }?.let { openSerial(it) }
+            } else {
+                serialStatus = "USB permission denied"
+            }
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        setContent { MaterialTheme { ForgeHome() } }
+        val filter = IntentFilter(USB_PERMISSION_ACTION)
+        if (Build.VERSION.SDK_INT >= 33) registerReceiver(usbPermissionReceiver, filter, RECEIVER_NOT_EXPORTED)
+        else @Suppress("DEPRECATION") registerReceiver(usbPermissionReceiver, filter)
+        setContent { MaterialTheme { ForgeHome(this) } }
+    }
+
+    fun connectSerial() {
+        try {
+            val manager = getSystemService(USB_SERVICE) as UsbManager
+            val driver = UsbSerialProber.getDefaultProber().findAllDrivers(manager).firstOrNull()
+            if (driver == null) {
+                serialStatus = "No supported USB serial device found. Check OTG cable and adapter."
+                return
+            }
+            pendingDriver = driver
+            if (manager.hasPermission(driver.device)) openSerial(driver)
+            else {
+                val permission = PendingIntent.getBroadcast(
+                    this, 0, Intent(USB_PERMISSION_ACTION).setPackage(packageName),
+                    PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_MUTABLE
+                )
+                manager.requestPermission(driver.device, permission)
+                serialStatus = "Waiting for USB permission…"
+            }
+        } catch (e: Exception) {
+            serialStatus = "USB error: ${e.message}"
+        }
+    }
+
+    private fun openSerial(driver: UsbSerialDriver) {
+        try {
+            closeSerial()
+            val manager = getSystemService(USB_SERVICE) as UsbManager
+            val connection = manager.openDevice(driver.device)
+                ?: throw IllegalStateException("Android could not open the USB device")
+            val port = driver.ports.first()
+            port.open(connection)
+            port.setParameters(115200, 8, UsbSerialPort.STOPBITS_1, UsbSerialPort.PARITY_NONE)
+            serialPort = port
+            readingSerial = true
+            serialStatus = "Connected: ${driver.device.deviceName} @ 115200 baud"
+            Thread {
+                val buffer = ByteArray(4096)
+                while (readingSerial) {
+                    try {
+                        val count = port.read(buffer, 500)
+                        if (count > 0) {
+                            val chunk = String(buffer, 0, count, Charsets.UTF_8)
+                            runOnUiThread {
+                                serialText = (serialText + chunk).takeLast(20000)
+                            }
+                        }
+                    } catch (e: Exception) {
+                        if (readingSerial) runOnUiThread { serialStatus = "Serial read stopped: ${e.message}" }
+                        break
+                    }
+                }
+            }.start()
+        } catch (e: Exception) {
+            serialStatus = "Serial open failed: ${e.message}"
+        }
+    }
+
+    fun sendSerial(value: String) {
+        try {
+            serialPort?.write((value + "\n").toByteArray(), 1000)
+                ?: run { serialStatus = "Connect a USB serial device first" }
+        } catch (e: Exception) { serialStatus = "Serial write failed: ${e.message}" }
+    }
+
+    fun clearSerial() { serialText = "" }
+
+    fun closeSerial() {
+        readingSerial = false
+        try { serialPort?.close() } catch (_: Exception) {}
+        serialPort = null
+        serialStatus = "USB disconnected"
+    }
+
+    override fun onDestroy() {
+        closeSerial()
+        try { unregisterReceiver(usbPermissionReceiver) } catch (_: Exception) {}
+        super.onDestroy()
     }
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun ForgeHome() {
-    var project by remember { mutableStateOf("MyFirmware") }
-    var board by remember { mutableStateOf("ESP32") }
+private fun ForgeHome(activity: MainActivity) {
+    val context = LocalContext.current
+    val prefs = remember { context.getSharedPreferences("espforge", Context.MODE_PRIVATE) }
+    val scope = rememberCoroutineScope()
+    var project by remember { mutableStateOf("ESPForgeSketch") }
+    var board by remember { mutableStateOf(boards[2]) }
+    var fqbn by remember { mutableStateOf(board.fqbn) }
     var mode by remember { mutableStateOf("Online") }
     var source by remember { mutableStateOf("#include <Arduino.h>\n\nvoid setup() {\n  Serial.begin(115200);\n}\n\nvoid loop() {\n}\n") }
-    var output by remember { mutableStateOf("Ready. Select a board and build mode.") }
+    var endpoint by remember { mutableStateOf(prefs.getString("endpoint", "") ?: "") }
+    var apiKey by remember { mutableStateOf(prefs.getString("apiKey", "") ?: "") }
+    var extraLibraries by remember { mutableStateOf("") }
+    var output by remember { mutableStateOf("Ready. Configure the online build API or prepare the offline Termux toolchain.") }
     var tab by remember { mutableStateOf("Editor") }
+    var busy by remember { mutableStateOf(false) }
+    var pendingZip by remember { mutableStateOf<ByteArray?>(null) }
+    var pendingExport by remember { mutableStateOf<File?>(null) }
+    var libraryFiles by remember { mutableStateOf(listOf<File>()) }
+    val libDir = remember { File(context.filesDir, "library-zips").apply { mkdirs() } }
+    fun refreshLibraries() { libraryFiles = libDir.listFiles()?.filter { it.isFile && it.extension.lowercase() == "zip" }?.sortedBy { it.name } ?: emptyList() }
 
-    Scaffold(topBar = { TopAppBar(title = { Text("ESP Forge IDE") }) }) { insets ->
-        Column(Modifier.padding(insets).fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            OutlinedTextField(project, { project = it }, label = { Text("Project name") }, singleLine = true, modifier = Modifier.fillMaxWidth())
-            Text("Target board", style = MaterialTheme.typography.titleMedium)
+    val saveBuildLauncher = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/zip")) { uri ->
+        val bytes = pendingZip
+        if (uri != null && bytes != null) {
+            runCatching { context.contentResolver.openOutputStream(uri)?.use { it.write(bytes) }; output = "Firmware ZIP saved." }
+                .onFailure { output = "Save failed: ${it.message}" }
+        }
+        pendingZip = null
+    }
+    val exportLibraryLauncher = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/zip")) { uri ->
+        val file = pendingExport
+        if (uri != null && file != null) runCatching {
+            context.contentResolver.openOutputStream(uri)?.use { out -> file.inputStream().use { it.copyTo(out) } }
+            output = "Library ZIP exported: ${file.name}"
+        }.onFailure { output = "Export failed: ${it.message}" }
+        pendingExport = null
+    }
+    val importLibraryLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri != null) runCatching {
+            val name = queryDisplayName(context, uri).ifBlank { "library-${System.currentTimeMillis()}.zip" }
+            require(name.endsWith(".zip", true)) { "Select a ZIP archive." }
+            val target = File(libDir, name)
+            context.contentResolver.openInputStream(uri)!!.use { input -> target.outputStream().use { input.copyTo(it) } }
+            copyToSharedLibraryFolder(context, uri, name)
+            refreshLibraries()
+            output = "Library imported. It is stored for offline builds under Documents/ESPForge/LibraryZips."
+        }.onFailure { output = "Library import failed: ${it.message}" }
+    }
+
+    LaunchedEffect(Unit) { refreshLibraries() }
+
+    Scaffold(topBar = { TopAppBar(title = { Text("ESP Forge IDE") }, actions = {
+        Text(if (busy) "BUILDING" else "v0.2", style = MaterialTheme.typography.labelMedium, modifier = Modifier.padding(end = 12.dp))
+    }) }) { insets ->
+        Column(
+            Modifier.padding(insets).fillMaxSize().verticalScroll(rememberScrollState()).padding(14.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            OutlinedTextField(project, { project = it.filter { c -> c.isLetterOrDigit() || c == '_' || c == '-' }.take(32) },
+                label = { Text("Project") }, singleLine = true, modifier = Modifier.fillMaxWidth())
             var expanded by remember { mutableStateOf(false) }
             ExposedDropdownMenuBox(expanded = expanded, onExpandedChange = { expanded = !expanded }) {
-                OutlinedTextField(board, {}, readOnly = true, label = { Text("Board") }, trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded) }, modifier = Modifier.menuAnchor().fillMaxWidth())
+                OutlinedTextField(board.label, {}, readOnly = true, label = { Text("Target board") },
+                    trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded) },
+                    modifier = Modifier.menuAnchor().fillMaxWidth())
                 ExposedDropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
-                    boards.forEach { item -> DropdownMenuItem(text = { Text(item) }, onClick = { board = item; expanded = false }) }
+                    boards.forEach { option ->
+                        DropdownMenuItem(text = { Text(option.label) }, onClick = {
+                            board = option; fqbn = option.fqbn; expanded = false
+                        })
+                    }
                 }
             }
-            Text("Build mode", style = MaterialTheme.typography.titleMedium)
+            OutlinedTextField(fqbn, { fqbn = it }, label = { Text("Board FQBN (advanced)") }, singleLine = true, modifier = Modifier.fillMaxWidth())
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                FilterChip(selected = mode == "Online", onClick = { mode = "Online" }, label = { Text("Online") })
-                FilterChip(selected = mode == "Offline", onClick = { mode = "Offline" }, label = { Text("Offline") })
+                FilterChip(selected = mode == "Online", onClick = { mode = "Online" }, label = { Text("Online build") })
+                FilterChip(selected = mode == "Offline", onClick = { mode = "Offline" }, label = { Text("Offline build") })
             }
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                listOf("Editor", "Libraries", "Upload", "Serial").forEach { item ->
+            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                listOf("Editor", "Libraries", "Upload", "Serial", "Settings").forEach { item ->
                     FilterChip(selected = tab == item, onClick = { tab = item }, label = { Text(item) })
                 }
             }
             when (tab) {
                 "Editor" -> {
-                    OutlinedTextField(source, { source = it }, label = { Text("main.ino / C++ source") }, minLines = 12, modifier = Modifier.fillMaxWidth())
-                    Button(onClick = { output = if (mode == "Online") "Online build requested. Connect a build service to compile and resolve libraries." else "Offline build selected. Install a compatible local toolchain and library ZIPs first." }, modifier = Modifier.fillMaxWidth()) { Text("Compile") }
+                    OutlinedTextField(source, { source = it }, label = { Text("main.ino") }, minLines = 13, modifier = Modifier.fillMaxWidth())
+                    OutlinedTextField(extraLibraries, { extraLibraries = it }, label = { Text("Additional library names (comma separated, optional)") }, minLines = 1, modifier = Modifier.fillMaxWidth())
+                    Button(enabled = !busy, onClick = {
+                        if (mode == "Online") {
+                            busy = true; output = "Sending sketch to remote Arduino CLI compiler…"
+                            scope.launch {
+                                val result = withContext(Dispatchers.IO) {
+                                    compileOnline(endpoint, apiKey, board.id, fqbn, project, source, extraLibraries)
+                                }
+                                busy = false
+                                result.onSuccess { bytes ->
+                                    pendingZip = bytes
+                                    output = "Online compilation succeeded. Firmware archive received; save it from the prompt."
+                                    saveBuildLauncher.launch("${project}-firmware.zip")
+                                }.onFailure { output = "Online build failed: ${it.message}" }
+                            }
+                        } else {
+                            busy = true
+                            output = "Starting local Arduino CLI build in Termux. The first build needs the selected board core already installed."
+                            val success = runOfflineCompile(activity, board, fqbn, project, source)
+                            busy = false
+                            output = if (success) "Offline compile command sent to Termux. Check its build output; firmware is written to Documents/ESPForge/Builds/$project." else "Could not start Termux. Install Termux, allow external apps, grant Run commands permission and run the offline setup first."
+                        }
+                    }, modifier = Modifier.fillMaxWidth()) { Text(if (busy) "Working…" else "Compile firmware") }
                 }
                 "Libraries" -> {
-                    Text("Online: libraries will be resolved by the remote build service from configured registries.")
-                    Text("Offline: import library ZIPs into the local library store; export installed libraries as ZIPs.")
-                    OutlinedButton(onClick = { output = "Library ZIP import/export UI is queued for implementation." }, modifier = Modifier.fillMaxWidth()) { Text("Manage library ZIPs") }
+                    Text("Online mode: known #include dependencies are looked up in the Arduino Library Manager index and fetched by the build server. No ZIP upload is needed.")
+                    Text("Offline mode: import ZIP archives once; compile reuses the stored archives after extracting them into the local library directory.")
+                    OutlinedButton(onClick = { importLibraryLauncher.launch(arrayOf("application/zip", "application/x-zip-compressed", "application/octet-stream")) }, modifier = Modifier.fillMaxWidth()) { Text("Import library ZIP") }
+                    if (libraryFiles.isEmpty()) Text("No library ZIPs imported yet.")
+                    libraryFiles.forEach { file ->
+                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                            Text(file.name, modifier = Modifier.weight(1f))
+                            TextButton(onClick = { pendingExport = file; exportLibraryLauncher.launch(file.name) }) { Text("Export") }
+                        }
+                    }
                 }
                 "Upload" -> {
-                    Text("Firmware upload uses the phone's USB OTG connection after a successful build.")
-                    Button(onClick = { output = "USB device detection and board-specific flashing are not wired yet." }, modifier = Modifier.fillMaxWidth()) { Text("Detect USB / Upload firmware") }
+                    Text("Firmware upload is a local USB operation. Online builds return a firmware ZIP; cloud servers cannot directly access the phone's OTG cable.")
+                    Text("USB serial driver detection is available in the Serial tab. Board-specific bootloader flashing is not yet wired into this build.")
+                    Button(onClick = { activity.connectSerial(); output = activity.serialStatus }, modifier = Modifier.fillMaxWidth()) { Text("Detect USB serial device") }
+                    Text("For now, extract the generated firmware ZIP and use a board-specific uploader. Do not flash an arbitrary .bin file at address 0x0; ESP32 images may include several files with different offsets.")
+                }
+                "Serial" -> {
+                    Text(activity.serialStatus)
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Button(onClick = { activity.connectSerial() }) { Text("Connect USB") }
+                        OutlinedButton(onClick = { activity.closeSerial() }) { Text("Disconnect") }
+                        TextButton(onClick = { activity.clearSerial() }) { Text("Clear") }
+                    }
+                    Surface(color = MaterialTheme.colorScheme.surfaceVariant, modifier = Modifier.fillMaxWidth()) {
+                        Text(activity.serialText.ifBlank { "Serial output will appear here." }, modifier = Modifier.padding(10.dp), style = MaterialTheme.typography.bodySmall)
+                    }
+                    var serialCommand by remember { mutableStateOf("") }
+                    OutlinedTextField(serialCommand, { serialCommand = it }, label = { Text("Send to device") }, modifier = Modifier.fillMaxWidth())
+                    Button(onClick = { activity.sendSerial(serialCommand); serialCommand = "" }) { Text("Send") }
+                    Text("Default baud rate: 115200. USB host support depends on phone OTG hardware and adapter compatibility.")
                 }
                 else -> {
-                    Text("Serial monitor")
-                    Text("USB serial transport and live log streaming are not wired yet.")
-                    OutlinedButton(onClick = { output = "Serial monitor transport is queued for implementation." }, modifier = Modifier.fillMaxWidth()) { Text("Connect serial") }
+                    Text("Online build service")
+                    OutlinedTextField(endpoint, { endpoint = it }, label = { Text("Build API base URL (e.g. https://your-host)") }, singleLine = true, modifier = Modifier.fillMaxWidth())
+                    OutlinedTextField(apiKey, { apiKey = it }, label = { Text("Build API key") }, singleLine = true, modifier = Modifier.fillMaxWidth())
+                    Button(onClick = { prefs.edit().putString("endpoint", endpoint.trim()).putString("apiKey", apiKey).apply(); output = "Build service settings saved on this device." }, modifier = Modifier.fillMaxWidth()) { Text("Save online settings") }
+                    Divider()
+                    Text("Offline prerequisites")
+                    Text("Install Termux (F-Droid/GitHub release), open it once, run termux-setup-storage, set allow-external-apps=true in ~/.termux/termux.properties, then grant ESP Forge the 'Run commands in Termux environment' permission.")
+                    Button(onClick = {
+                        val ok = runTermuxSetup(activity, board)
+                        output = if (ok) "Termux offline toolchain setup launched. Keep Termux open until downloads and core installation finish." else "Termux setup could not start. Check Termux installation and permissions."
+                    }, modifier = Modifier.fillMaxWidth()) { Text("Prepare offline toolchain for selected board") }
+                    Text("Offline setup downloads Linux toolchains once; later builds can run without internet when the selected board core and required libraries are already cached.")
                 }
             }
-            Text("Build / device output", style = MaterialTheme.typography.titleMedium)
+            Text("Build log", style = MaterialTheme.typography.titleMedium)
             Surface(color = MaterialTheme.colorScheme.surfaceVariant, modifier = Modifier.fillMaxWidth()) {
-                Text(output, modifier = Modifier.padding(12.dp))
+                Text(output, modifier = Modifier.padding(12.dp), style = MaterialTheme.typography.bodySmall)
             }
         }
     }
+}
+
+private fun compileOnline(
+    endpoint: String, apiKey: String, board: String, fqbn: String,
+    project: String, source: String, libraryText: String
+): Result<ByteArray> = runCatching {
+    require(endpoint.startsWith("https://") || endpoint.startsWith("http://")) { "Enter a valid build API URL in Settings." }
+    require(apiKey.isNotBlank()) { "Enter the build API key in Settings." }
+    require(source.isNotBlank()) { "Sketch is empty." }
+    val libs = JSONArray()
+    libraryText.split(",").map { it.trim() }.filter { it.isNotBlank() }.forEach { libs.put(it) }
+    val files = JSONObject().put("main.ino", source)
+    val body = JSONObject().put("board", board).put("fqbn", fqbn).put("files", files).put("libraries", libs)
+    val url = URL(endpoint.trimEnd('/') + "/v1/compile")
+    val conn = (url.openConnection() as HttpURLConnection).apply {
+        requestMethod = "POST"
+        connectTimeout = 20000
+        readTimeout = 900000
+        doOutput = true
+        setRequestProperty("Content-Type", "application/json")
+        setRequestProperty("X-API-Key", apiKey)
+    }
+    conn.outputStream.use { it.write(body.toString().toByteArray(Charsets.UTF_8)) }
+    val code = conn.responseCode
+    if (code !in 200..299) {
+        val error = (conn.errorStream ?: conn.inputStream).bufferedReader().use { it.readText() }
+        throw IllegalStateException("HTTP $code: $error")
+    }
+    val bytes = conn.inputStream.use { input ->
+        val out = ByteArrayOutputStream()
+        val buffer = ByteArray(8192)
+        while (true) { val n = input.read(buffer); if (n < 0) break; out.write(buffer, 0, n) }
+        out.toByteArray()
+    }
+    require(bytes.size >= 4 && bytes[0] == 0x50.toByte() && bytes[1] == 0x4b.toByte()) {
+        "Build server did not return a ZIP firmware archive."
+    }
+    conn.disconnect()
+    bytes
+}
+
+private fun runOfflineCompile(activity: MainActivity, board: BoardOption, fqbn: String, project: String, source: String): Boolean {
+    return runCatching {
+        require(fqbn.matches(Regex("[A-Za-z0-9_.:-]+"))) { "Invalid FQBN" }
+        val sketch = "$WORKSPACE/Projects/$project"
+        val libs = "$WORKSPACE/InstalledLibraries"
+        val out = "$WORKSPACE/Builds/$project"
+        val script = """
+            set -e
+            mkdir -p '$sketch' '$libs' '$out'
+            cat > '$sketch/main.ino'
+            proot-distro login debian --bind /storage:/storage -- bash -lc 'set -e
+              mkdir -p "$libs" "$out"
+              for z in "$LIBRARY_ZIPS"/*.zip; do
+                [ -f "$z" ] || continue
+                tmp="$(mktemp -d)"
+                unzip -oq "$z" -d "$tmp"
+                prop="$(find "$tmp" -name library.properties -print -quit)"
+                if [ -n "$prop" ]; then
+                  src="$(dirname "$prop")"
+                  cp -a "$src" "$libs/$(basename "$src")"
+                fi
+                rm -rf "$tmp"
+              done
+              cd "$sketch"
+              arduino-cli compile --fqbn "$fqbn" --libraries "$libs" --output-dir "$out" .
+            '
+        """.trimIndent()
+        val intent = Intent(TERMUX_ACTION).apply {
+            component = ComponentName("com.termux", "com.termux.app.RunCommandService")
+            putExtra("com.termux.RUN_COMMAND_PATH", "$PREFIX/bin/bash")
+            putExtra("com.termux.RUN_COMMAND_ARGUMENTS", arrayOf("-lc", script))
+            putExtra("com.termux.RUN_COMMAND_STDIN", source)
+            putExtra("com.termux.RUN_COMMAND_BACKGROUND", false)
+            putExtra("com.termux.RUN_COMMAND_WORKDIR", "$HOME")
+            putExtra("com.termux.RUN_COMMAND_LABEL", "ESP Forge offline compile")
+        }
+        activity.startService(intent)
+        true
+    }.getOrElse { false }
+}
+
+private fun runTermuxSetup(activity: MainActivity, board: BoardOption): Boolean {
+    return runCatching {
+        val fqbn = board.fqbn
+        val core = board.core
+        val script = """
+            set -e
+            pkg update -y
+            pkg install -y proot-distro
+            if [ ! -d "$PREFIX/var/lib/proot-distro/installed-rootfs/debian" ]; then proot-distro install debian; fi
+            proot-distro login debian -- bash -lc 'set -e
+              apt-get update
+              apt-get install -y curl ca-certificates unzip python3
+              arch="$(dpkg --print-architecture)"
+              if [ "$arch" = "arm64" ]; then asset="Linux_ARM64"; elif [ "$arch" = "amd64" ]; then asset="Linux_64bit"; else echo "Unsupported Debian architecture: $arch"; exit 2; fi
+              curl -fsSL "https://downloads.arduino.cc/arduino-cli/arduino-cli_1.5.1_${asset}.tar.gz" -o /tmp/arduino-cli.tar.gz
+              tar -xzf /tmp/arduino-cli.tar.gz -C /usr/local/bin arduino-cli
+              mkdir -p /root/.arduino15
+              cat > /root/.arduino15/arduino-cli.yaml <<EOF
+board_manager:
+  additional_urls:
+    - https://espressif.github.io/arduino-esp32/package_esp32_index.json
+    - https://arduino.esp8266.com/stable/package_esp8266com_index.json
+    - https://github.com/stm32duino/BoardManagerFiles/raw/main/package_stmicroelectronics_index.json
+    - https://ch32-riscv-ug.github.io/ArduinoCore-CH32RV/package_ch32-riscv-ug_index.json
+EOF
+              arduino-cli core update-index
+              arduino-cli core install "$core"
+              echo "Offline toolchain installed for $fqbn"
+            '
+        """.trimIndent()
+        val intent = Intent(TERMUX_ACTION).apply {
+            component = ComponentName("com.termux", "com.termux.app.RunCommandService")
+            putExtra("com.termux.RUN_COMMAND_PATH", "$PREFIX/bin/bash")
+            putExtra("com.termux.RUN_COMMAND_ARGUMENTS", arrayOf("-lc", script))
+            putExtra("com.termux.RUN_COMMAND_BACKGROUND", false)
+            putExtra("com.termux.RUN_COMMAND_WORKDIR", "$HOME")
+            putExtra("com.termux.RUN_COMMAND_LABEL", "ESP Forge toolchain setup")
+        }
+        activity.startService(intent)
+        true
+    }.getOrElse { false }
+}
+
+private fun queryDisplayName(context: Context, uri: Uri): String {
+    context.contentResolver.query(uri, arrayOf(MediaStore.MediaColumns.DISPLAY_NAME), null, null, null)?.use {
+        if (it.moveToFirst()) return it.getString(0) ?: ""
+    }
+    return uri.lastPathSegment?.substringAfterLast('/') ?: ""
+}
+
+private fun copyToSharedLibraryFolder(context: Context, source: Uri, name: String) {
+    require(Build.VERSION.SDK_INT >= 29) { "Android 10 or newer is required for shared library storage." }
+    val values = ContentValues().apply {
+        put(MediaStore.MediaColumns.DISPLAY_NAME, name)
+        put(MediaStore.MediaColumns.MIME_TYPE, "application/zip")
+        put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOCUMENTS + "/ESPForge/LibraryZips")
+        put(MediaStore.MediaColumns.IS_PENDING, 1)
+    }
+    val uri = context.contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+        ?: throw IllegalStateException("Could not create shared library ZIP")
+    context.contentResolver.openInputStream(source)!!.use { input ->
+        context.contentResolver.openOutputStream(uri)!!.use { output -> input.copyTo(output) }
+    }
+    val ready = ContentValues().apply { put(MediaStore.MediaColumns.IS_PENDING, 0) }
+    context.contentResolver.update(uri, ready, null, null)
 }
