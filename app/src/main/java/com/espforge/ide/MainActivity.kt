@@ -10,6 +10,7 @@ import android.os.Bundle
 import android.os.Environment
 import android.provider.MediaStore
 import android.util.Base64
+import android.view.View
 import android.content.ContentValues
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -130,6 +131,18 @@ class MainActivity : ComponentActivity() {
                     onSurface = Color(0xFFECEFF1)
                 )
                 else -> lightColorScheme()
+            }
+            SideEffect {
+                val dark = themeMode != "Light"
+                val barColor = when (themeMode) {
+                    "AMOLED" -> android.graphics.Color.BLACK
+                    "Dark" -> android.graphics.Color.rgb(18, 18, 18)
+                    else -> android.graphics.Color.WHITE
+                }
+                window.statusBarColor = barColor
+                window.navigationBarColor = barColor
+                window.decorView.systemUiVisibility = if (dark) 0 else
+                    (View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR or View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR)
             }
             MaterialTheme(colorScheme = colors) {
                 ForgeHome(this, themeMode) { selected ->
