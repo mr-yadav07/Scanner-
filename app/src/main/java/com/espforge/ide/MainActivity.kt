@@ -179,7 +179,7 @@ class MainActivity : ComponentActivity() {
                     ?: throw IllegalArgumentException("Choose an AVR .hex output generated for Uno/Nano.")
                 flashAvrFirmware(device, boardId, String(hexImage.bytes, Charsets.UTF_8), onProgress)
             }
-            else -> flashEspFirmware(device, boardId, images, onProgress)
+            else -> flashEspFirmware(device, boardId, images) { progress -> onProgress(progress.percent) }
         }
     }
 
@@ -465,7 +465,7 @@ private fun ForgeHome(activity: MainActivity) {
                                 output = "Entering ROM bootloader and flashing firmware…"
                                 val attempt = runCatching {
                                     activity.flashFirmware(result.device, board.id, firmwareImages) { progress ->
-                                        activity.runOnUiThread { flashProgress = progress.percent }
+                                        activity.runOnUiThread { flashProgress = progress }
                                     }
                                 }
                                 busy = false
