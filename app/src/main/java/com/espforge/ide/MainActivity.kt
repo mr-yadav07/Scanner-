@@ -82,6 +82,7 @@ class MainActivity : ComponentActivity() {
     private var requestedBaudRate = 115200
     @Volatile private var activeBuildConnection: HttpURLConnection? = null
     fun setActiveBuildConnection(connection: HttpURLConnection?) { activeBuildConnection = connection }
+    fun resetOfflineBuildOutput() { offlineBuildOutput = "" }
     fun cancelOnlineBuild() { activeBuildConnection?.disconnect() }
 
     private val termuxResultReceiver = object : BroadcastReceiver() {
@@ -638,6 +639,7 @@ private fun ForgeHome(activity: MainActivity, themeMode: String, onThemeChange: 
                             buildStage = "Starting Termux"
                             buildProgress = 3
                             output = "Starting local Arduino CLI build in Termux. Live output will appear below."
+                            activity.resetOfflineBuildOutput()
                             val success = if (board.id == "ch32v003") false else runOfflineCompile(activity, board, fqbn, project, projectFiles)
                             if (success) {
                                 buildStage = "Waiting for Termux"
