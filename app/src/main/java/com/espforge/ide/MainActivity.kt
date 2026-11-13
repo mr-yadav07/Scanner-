@@ -772,22 +772,9 @@ private fun runOfflineCompile(activity: MainActivity, board: BoardOption, fqbn: 
               cd '${sketch}'
               if ! arduino-cli compile --fqbn '${fqbn}' --libraries '${libs}' --output-dir '${out}' . > '${out}/build.log' 2>&1; then cat '${out}/build.log'; exit 1; fi
               mkdir -p '${out}/package/firmware'
-              find '${out}' -maxdepth 1 -type f \\( -name '*.bin' -o -name '*.hex' -o -name '*.uf2' \\) -exec cp {} '${out}/package/firmware/' \\;
-              count=${'(find '${out}/package/firmware' -type f | wc -l)
-              [ "@@DOLLAR@@count" -gt 0 ] || { echo 'No firmware artifacts produced'; exit 2; }
-              printf '{"board":"${board.id}","fqbn":"${fqbn}"}' > '${out}/package/build-manifest.json'
-              cp '${out}/build.log' '${out}/package/build.log'
-              cd '${out}/package'
-              zip -qr '${out}/firmware.zip' firmware build-manifest.json build.log
-              rm -rf '${out}/package'
-              echo 'Build succeeded. Firmware package: ${out}/firmware.zip'}(find '${out}/package/firmware' -type f | wc -l)
-              [ "${'count" -gt 0 ] || { echo 'No firmware artifacts produced'; exit 2; }
-              printf '{"board":"${board.id}","fqbn":"${fqbn}"}' > '${out}/package/build-manifest.json'
-              cp '${out}/build.log' '${out}/package/build.log'
-              cd '${out}/package'
-              zip -qr '${out}/firmware.zip' firmware build-manifest.json build.log
-              rm -rf '${out}/package'
-              echo 'Build succeeded. Firmware package: ${out}/firmware.zip'}count" -gt 0 ] || { echo 'No firmware artifacts produced'; exit 2; }
+              find '${out}' -maxdepth 1 -type f \( -name '*.bin' -o -name '*.hex' -o -name '*.uf2' \) -exec cp {} '${out}/package/firmware/' \;
+              count=${'$'}(find '${out}/package/firmware' -type f | wc -l)
+              [ "${'$'}count" -gt 0 ] || { echo 'No firmware artifacts produced'; exit 2; }
               printf '{"board":"${board.id}","fqbn":"${fqbn}"}' > '${out}/package/build-manifest.json'
               cp '${out}/build.log' '${out}/package/build.log'
               cd '${out}/package'
