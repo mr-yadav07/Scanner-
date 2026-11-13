@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: esp-forge-build-api
+    runtime: docker
+    dockerfilePath: ./backend/Dockerfile
+    dockerContext: .
+    plan: starter
+    healthCheckPath: /health
+    envVars:
+      - key: API_KEY
+        generateValue: true
