@@ -19,6 +19,7 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
@@ -547,12 +548,12 @@ private fun ForgeHome(activity: MainActivity, themeMode: String, onThemeChange: 
                         OutlinedButton(onClick = { projectExportLauncher.launch("${project}-project.zip") }) { Text("Export project") }
                     }
                     Text("Project files · ${projectFiles.size}", style = MaterialTheme.typography.titleSmall)
-                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                         projectFiles.keys.forEach { fileName ->
                             FilterChip(selected = activeFileName == fileName, onClick = { activeFileName = fileName }, label = { Text(fileName) })
                         }
                     }
-                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                         OutlinedButton(onClick = { addProjectFile("h") }) { Text("+ .h") }
                         OutlinedButton(onClick = { addProjectFile("cpp") }) { Text("+ .cpp") }
                         OutlinedButton(onClick = { addProjectFile("c") }) { Text("+ .c") }
