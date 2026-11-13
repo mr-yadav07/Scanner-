@@ -51,7 +51,7 @@ private const val WORKSPACE = "/storage/emulated/0/Documents/ESPForge"
 private const val LIBRARY_ZIPS = "$WORKSPACE/LibraryZips"
 
 private data class BoardOption(val id: String, val label: String, val fqbn: String, val core: String)
-private data class FlashPermissionResult(val device: UsbDevice, val granted: Boolean)
+internal data class FlashPermissionResult(val device: UsbDevice, val granted: Boolean)
 private val boards = listOf(
     BoardOption("arduino_uno", "Arduino Uno", "arduino:avr:uno", "arduino:avr"),
     BoardOption("arduino_nano", "Arduino Nano", "arduino:avr:nano", "arduino:avr"),
@@ -132,12 +132,12 @@ class MainActivity : ComponentActivity() {
         val flasher: EspFlasher = if (boardId == "esp8266") {
             Esp8266Flasher(transport, autoReset = true)
         } else {
-            Esp32Flasher(transport, autoReset = true, forcedChip = chip)
+            Esp32Flasher(transport, autoReset = true)
         }
         try {
             flasher.connect()
             val detected = flasher.detectChip()
-            flasher.writeFirmware(images) { onProgress(it) }
+            require(detected.chipId == chip) { "Selected target is $chip but the connected board reports ${detected.chipId}. Flash cancelled." }\n            flasher.writeFirmware(images) { onProgress(it) }
             flasher.verifyFirmware(images)
             flasher.reset()
             "Flash and MD5 verification succeeded. Detected: ${detected.description}, flash: ${detected.flashSizeLabel}."
@@ -252,7 +252,7 @@ private fun ForgeHome(activity: MainActivity) {
     var firmwareLabel by remember { mutableStateOf("No firmware selected") }
     var flashAddress by remember { mutableStateOf("0x10000") }
     var flashProgress by remember { mutableStateOf(0f) }
-    val usbManager = remember { context.getSystemService(ComponentActivity.USB_SERVICE) as UsbManager }
+    val usbManager = remember { context.getSystemService(Context.USB_SERVICE) as UsbManager }
     val selectedUsb = usbDevices.firstOrNull { it.deviceId == selectedUsbId }
     val libDir = remember { File(context.filesDir, "library-zips").apply { mkdirs() } }
     fun refreshLibraries() { libraryFiles = libDir.listFiles()?.filter { it.isFile && it.extension.lowercase() == "zip" }?.sortedBy { it.name } ?: emptyList() }
