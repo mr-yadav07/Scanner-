@@ -75,6 +75,7 @@ class MainActivity : ComponentActivity() {
     private var serialPort: UsbSerialPort? = null
     private var pendingDriver: UsbSerialDriver? = null
     @Volatile private var readingSerial = false
+    private var requestedBaudRate = 115200
 
     private val termuxResultReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
@@ -94,7 +95,7 @@ class MainActivity : ComponentActivity() {
             }
             if (intent.action != USB_PERMISSION_ACTION) return
             if (granted && device != null) {
-                pendingDriver?.takeIf { it.device.deviceId == device.deviceId }?.let { openSerial(it) }
+                pendingDriver?.takeIf { it.device.deviceId == device.deviceId }?.let { openSerial(it, requestedBaudRate) }
             } else {
                 serialStatus = "USB permission denied"
             }
@@ -199,7 +200,8 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    fun connectSerial() {
+    fun connectSerial(baudRate: Int = 115200) {
+        requestedBaudRate = baudRate
         try {
             val manager = getSystemService(USB_SERVICE) as UsbManager
             val driver = UsbSerialProber.getDefaultProber().findAllDrivers(manager).firstOrNull()
@@ -208,7 +210,7 @@ class MainActivity : ComponentActivity() {
                 return
             }
             pendingDriver = driver
-            if (manager.hasPermission(driver.device)) openSerial(driver)
+            if (manager.hasPermission(driver.device)) openSerial(driver, baudRate)
             else {
                 val permission = PendingIntent.getBroadcast(
                     this, 0, Intent(USB_PERMISSION_ACTION).setPackage(packageName),
@@ -222,7 +224,7 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun openSerial(driver: UsbSerialDriver) {
+    private fun openSerial(driver: UsbSerialDriver, baudRate: Int) {
         try {
             closeSerial()
             val manager = getSystemService(USB_SERVICE) as UsbManager
@@ -230,10 +232,10 @@ class MainActivity : ComponentActivity() {
                 ?: throw IllegalStateException("Android could not open the USB device")
             val port = driver.ports.first()
             port.open(connection)
-            port.setParameters(115200, 8, UsbSerialPort.STOPBITS_1, UsbSerialPort.PARITY_NONE)
+            port.setParameters(baudRate, 8, UsbSerialPort.STOPBITS_1, UsbSerialPort.PARITY_NONE)
             serialPort = port
             readingSerial = true
-            serialStatus = "Connected: ${driver.device.deviceName} @ 115200 baud"
+            serialStatus = "Connected: ${driver.device.deviceName} @ ${baudRate} baud"
             Thread {
                 val buffer = ByteArray(4096)
                 while (readingSerial) {
@@ -583,8 +585,20 @@ private fun ForgeHome(activity: MainActivity) {
                 }
                 "Serial" -> {
                     Text(activity.serialStatus)
+                    var baudExpanded by remember { mutableStateOf(false) }
+                    var serialBaudRate by remember { mutableStateOf(115200) }
+                    ExposedDropdownMenuBox(expanded = baudExpanded, onExpandedChange = { baudExpanded = !baudExpanded }) {
+                        OutlinedTextField(serialBaudRate.toString(), {}, readOnly = true, label = { Text("Baud rate") },
+                            trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(baudExpanded) },
+                            modifier = Modifier.menuAnchor().fillMaxWidth())
+                        ExposedDropdownMenu(expanded = baudExpanded, onDismissRequest = { baudExpanded = false }) {
+                            listOf(9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600).forEach { rate ->
+                                DropdownMenuItem(text = { Text(rate.toString()) }, onClick = { serialBaudRate = rate; baudExpanded = false })
+                            }
+                        }
+                    }
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        Button(onClick = { activity.connectSerial() }) { Text("Connect USB") }
+                        Button(onClick = { activity.connectSerial(serialBaudRate) }) { Text("Connect USB") }
                         OutlinedButton(onClick = { activity.closeSerial() }) { Text("Disconnect") }
                         TextButton(onClick = { activity.clearSerial() }) { Text("Clear") }
                     }
@@ -594,7 +608,7 @@ private fun ForgeHome(activity: MainActivity) {
                     var serialCommand by remember { mutableStateOf("") }
                     OutlinedTextField(serialCommand, { serialCommand = it }, label = { Text("Send to device") }, modifier = Modifier.fillMaxWidth())
                     Button(onClick = { activity.sendSerial(serialCommand); serialCommand = "" }) { Text("Send") }
-                    Text("Default baud rate: 115200. USB host support depends on phone OTG hardware and adapter compatibility.")
+                    Text("USB host support depends on phone OTG hardware and adapter compatibility.")
                 }
                 else -> {
                     Text("Online build service")
