@@ -90,3 +90,13 @@ def test_build_cache_paths_are_stable_and_project_scoped(tmp_path, monkeypatch):
     assert sketch_a != sketch_b
     assert build_a != build_b
     assert lock_a is not lock_b
+
+
+def test_parallel_jobs_setting_is_bounded():
+    request = CompileRequest(board="esp32", project_id="fast-build", jobs=4, files={"main.ino": "void setup(){}"})
+    assert request.jobs == 4
+    try:
+        CompileRequest(board="esp32", jobs=32, files={"main.ino": "void setup(){}"})
+        assert False
+    except ValueError:
+        pass
