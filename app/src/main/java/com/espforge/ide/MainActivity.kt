@@ -644,7 +644,7 @@ private fun ForgeHome(activity: MainActivity, themeMode: String, onThemeChange: 
                             activity.resetOfflineBuildOutput()
                             val success = if (board.id == "ch32v003") false else runOfflineCompile(activity, board, fqbn, project, projectFiles, compileJobs)
                             if (success) {
-                                buildStage = "Waiting for Termux"
+                                buildStage = "Waiting for local compiler"
                                 buildLog = "Termux accepted the build command. Waiting for compiler output…"
                                 buildProgress = 5
                                 output = "Offline build started. Compiler output is being monitored."
@@ -1010,7 +1010,7 @@ private fun runOfflineCompile(activity: MainActivity, board: BoardOption, fqbn: 
             rm -f '$out/artifacts/'*
             $sourceWriter
             proot-distro login --bind /storage:/storage debian -- bash -lc 'set -e
-              cache="${'$'}HOME/.cache/espforge/${project}/${board.id}"
+              cache="${'$'}HOME/.cache/espforge/${project}/${fqbn.replace(':', '_')}"
               mkdir -p "${'$'}cache/build" "${libs}" "${out}"
               for z in "${zipFolder}"/*.zip; do
                 [ -f "${'$'}z" ] || continue
