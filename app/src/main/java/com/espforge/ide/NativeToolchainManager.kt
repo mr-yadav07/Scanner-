@@ -36,6 +36,7 @@ internal class NativeToolchainManager(context: Context) {
     private val loader = File(app.applicationInfo.nativeLibraryDir, "libproot-loader.so")
 
     @Volatile private var activeProcess: Process? = null
+    @Volatile private var activeHttpProxy: AndroidHttpProxy? = null
 
     data class CompileResult(val archive: ByteArray, val log: String)
     private data class RunResult(val exitCode: Int, val output: String, val timedOut: Boolean)
@@ -54,49 +55,53 @@ internal class NativeToolchainManager(context: Context) {
         ensureNativeRuntime()
         ensureWorkspace()
         writeResolverFiles()
-        val cliReady = runGuest(
-            listOf("/bin/bash", "-lc", "command -v arduino-cli >/dev/null 2>&1"),
-            timeoutMs = 30_000
-        )
-        if (cliReady.exitCode != 0) {
-            onLine("Installing Debian runtime dependencies and Arduino CLI…")
-            runChecked(
+        // PRoot guest DNS/UDP is restricted on some Android networks. Route package
+        // manager HTTP(S) traffic through Android's native socket/DNS implementation.
+        val proxy = AndroidHttpProxy().start()
+        activeHttpProxy = proxy
+        try {
+            val cliReady = runGuest(
+                listOf("/bin/bash", "-lc", "command -v arduino-cli >/dev/null 2>&1"),
+                timeoutMs = 30_000
+            )
+            if (cliReady.exitCode != 0) {
+                onLine("Installing Debian runtime dependencies and Arduino CLI…")
+                runChecked(
+                    listOf("/bin/bash", "-lc",
+                        "set -e; export DEBIAN_FRONTEND=noninteractive; apt-get update; " +
+                        "apt-get install -y ca-certificates curl python3 unzip zip xz-utils"
+                    ), 30 * 60_000L, onLine
+                )
+                val cliArchive = File(workspace, "Downloads/arduino-cli.tar.gz")
+                downloadWithRetry(
+                    "https://downloads.arduino.cc/arduino-cli/arduino-cli_1.6.0_Linux_ARM64.tar.gz",
+                    cliArchive, onLine
+                )
+                runChecked(
+                    listOf("/bin/bash", "-lc",
+                        "set -e; tar -xzf /workspace/Downloads/arduino-cli.tar.gz " +
+                        "-C /usr/local/bin arduino-cli; chmod 755 /usr/local/bin/arduino-cli"
+                    ), 5 * 60_000L, onLine
+                )
+                cliArchive.delete()
+            }
+            configureArduinoCli()
+            val installed = runGuest(
                 listOf("/bin/bash", "-lc",
-                    "set -e; export DEBIAN_FRONTEND=noninteractive; apt-get update; " +
-                    "apt-get install -y ca-certificates curl python3 unzip zip xz-utils"
-                ), 30 * 60_000L, onLine
+                    "arduino-cli core list --format json | grep -Eq '\\"id\\"[[:space:]]*:[[:space:]]*\\"$core\\"'"),
+                timeoutMs = 60_000
             )
-            // Download with Android's network stack. PRoot guest DNS can fail on
-            // mobile networks even while Android itself has working connectivity.
-            val cliArchive = File(workspace, "Downloads/arduino-cli.tar.gz")
-            downloadWithRetry(
-                "https://downloads.arduino.cc/arduino-cli/arduino-cli_1.6.0_Linux_ARM64.tar.gz",
-                cliArchive,
-                onLine
-            )
-            runChecked(
-                listOf("/bin/bash", "-lc",
-                    "set -e; tar -xzf /workspace/Downloads/arduino-cli.tar.gz " +
-                    "-C /usr/local/bin arduino-cli; chmod 755 /usr/local/bin/arduino-cli"
-                ), 5 * 60_000L, onLine
-            )
-            cliArchive.delete()
+            if (installed.exitCode != 0) {
+                onLine("Updating board indexes for $fqbn…")
+                runChecked(listOf("arduino-cli", "core", "update-index"), 10 * 60_000L, onLine)
+                onLine("Installing $core and vendor toolchains through Android-backed HTTPS…")
+                runChecked(listOf("arduino-cli", "core", "install", core), 60 * 60_000L, onLine)
+            } else onLine("Cached board core found: $core")
+            onLine("Local toolchain ready: $fqbn")
+        } finally {
+            activeHttpProxy = null
+            proxy.close()
         }
-        configureArduinoCli()
-        val installed = runGuest(
-            listOf("/bin/bash", "-lc",
-                "arduino-cli core list --format json | grep -Eq '\"id\"[[:space:]]*:[[:space:]]*\"$core\"'"),
-            timeoutMs = 60_000
-        )
-        if (installed.exitCode != 0) {
-            onLine("Updating board indexes for $fqbn…")
-            runChecked(listOf("arduino-cli", "core", "update-index"), 10 * 60_000L, onLine)
-            onLine("Installing $core (first setup downloads vendor toolchains)…")
-            runChecked(listOf("arduino-cli", "core", "install", core), 45 * 60_000L, onLine)
-        } else {
-            onLine("Cached board core found: $core")
-        }
-        onLine("Local toolchain ready: $fqbn")
     }
 
     fun compile(
@@ -492,7 +497,13 @@ internal class NativeToolchainManager(context: Context) {
             "HOME=/root", "USER=root", "LOGNAME=root", "SHELL=/bin/bash",
             "TERM=xterm-256color", "LANG=C.UTF-8",
             "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-            "TMPDIR=/tmp"
+            "TMPDIR=/tmp",
+            "HTTP_PROXY=http://127.0.0.1:" + (activeHttpProxy?.port ?: 0),
+            "HTTPS_PROXY=http://127.0.0.1:" + (activeHttpProxy?.port ?: 0),
+            "http_proxy=http://127.0.0.1:" + (activeHttpProxy?.port ?: 0),
+            "https_proxy=http://127.0.0.1:" + (activeHttpProxy?.port ?: 0),
+            "ALL_PROXY=http://127.0.0.1:" + (activeHttpProxy?.port ?: 0),
+            "NO_PROXY=127.0.0.1,localhost"
         )
         command += guestArgs
         val builder = ProcessBuilder(command).redirectErrorStream(true)
@@ -540,6 +551,113 @@ internal class NativeToolchainManager(context: Context) {
         }
         return digest.digest().joinToString("") { "%02x".format(it) }
     }
+
+
+/** HTTP CONNECT proxy: Android process performs DNS and outbound TCP for PRoot. */
+private class AndroidHttpProxy : java.io.Closeable {
+    private val server = java.net.ServerSocket()
+    @Volatile private var running = false
+    val port: Int get() = server.localPort
+
+    fun start(): AndroidHttpProxy {
+        server.reuseAddress = true
+        server.bind(java.net.InetSocketAddress(java.net.InetAddress.getByName("127.0.0.1"), 0), 32)
+        running = true
+        Thread({
+            while (running) try {
+                val client = server.accept()
+                Thread({ handle(client) }, "espforge-proxy-client").apply { isDaemon = true; start() }
+            } catch (_: Exception) {
+                if (running) android.util.Log.w("EspForgeProxy", "Proxy accept failed")
+            }
+        }, "espforge-proxy-accept").apply { isDaemon = true; start() }
+        return this
+    }
+
+    private fun readHeaders(input: java.io.InputStream): String {
+        val out = java.io.ByteArrayOutputStream()
+        var state = 0
+        while (out.size() < 65536) {
+            val b = input.read()
+            if (b < 0) break
+            out.write(b)
+            state = when {
+                state == 0 && b == 13 -> 1
+                state == 1 && b == 10 -> 2
+                state == 2 && b == 13 -> 3
+                state == 3 && b == 10 -> 4
+                b == 13 -> 1
+                else -> 0
+            }
+            if (state == 4) return out.toString("ISO-8859-1")
+        }
+        throw java.io.IOException("Invalid or oversized proxy request headers")
+    }
+
+    private fun handle(client: java.net.Socket) {
+        var upstream: java.net.Socket? = null
+        try {
+            client.soTimeout = 120_000
+            val input = java.io.BufferedInputStream(client.getInputStream())
+            val headerText = readHeaders(input)
+            val parts = headerText.substringBefore("\r\n").split(' ')
+            if (parts.size < 3) throw java.io.IOException("Malformed proxy request")
+            if (parts[0].equals("CONNECT", true)) {
+                val authority = parts[1]
+                val host = authority.substringBeforeLast(':')
+                val remotePort = authority.substringAfterLast(':', "443").toIntOrNull() ?: 443
+                upstream = java.net.Socket()
+                upstream.connect(java.net.InetSocketAddress(host, remotePort), 30_000)
+                upstream.soTimeout = 120_000
+                client.getOutputStream().write("HTTP/1.1 200 Connection Established\r\n\r\n".toByteArray(Charsets.US_ASCII))
+                client.getOutputStream().flush()
+                tunnel(client, upstream)
+            } else {
+                val uri = java.net.URI(parts[1])
+                val host = uri.host ?: throw java.io.IOException("URL has no host")
+                val remotePort = if (uri.port > 0) uri.port else if (uri.scheme == "https") 443 else 80
+                upstream = java.net.Socket()
+                upstream.connect(java.net.InetSocketAddress(host, remotePort), 30_000)
+                upstream.soTimeout = 120_000
+                val path = (uri.rawPath?.takeIf { it.isNotEmpty() } ?: "/") + (uri.rawQuery?.let { "?$it" } ?: "")
+                val rewritten = buildString {
+                    append(parts[0]).append(' ').append(path).append(' ').append(parts[2]).append("\r\n")
+                    headerText.substringAfter("\r\n").split("\r\n").forEach { line ->
+                        if (line.isNotBlank() && !line.startsWith("Proxy-", true)) append(line).append("\r\n")
+                    }
+                    append("\r\n")
+                }
+                upstream.getOutputStream().write(rewritten.toByteArray(Charsets.ISO_8859_1))
+                upstream.getOutputStream().flush()
+                val remote = upstream
+                val writer = Thread {
+                    runCatching { input.copyTo(remote.getOutputStream()); remote.shutdownOutput() }
+                }.apply { isDaemon = true; start() }
+                runCatching { remote.getInputStream().copyTo(client.getOutputStream()) }
+                writer.join(120_000)
+            }
+        } catch (e: Exception) {
+            runCatching { client.getOutputStream().write("HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\nContent-Length: 0\r\n\r\n".toByteArray(Charsets.US_ASCII)) }
+            android.util.Log.w("EspForgeProxy", "Proxy request failed: \${e.message}")
+        } finally {
+            runCatching { upstream?.close() }
+            runCatching { client.close() }
+        }
+    }
+
+    private fun tunnel(client: java.net.Socket, upstream: java.net.Socket) {
+        val writer = Thread {
+            runCatching { client.getInputStream().copyTo(upstream.getOutputStream()); upstream.shutdownOutput() }
+        }.apply { isDaemon = true; start() }
+        runCatching { upstream.getInputStream().copyTo(client.getOutputStream()) }
+        writer.join(120_000)
+    }
+
+    override fun close() {
+        running = false
+        runCatching { server.close() }
+    }
+}
 
     companion object {
         private const val TAG = "EspForgeNativeRuntime"
