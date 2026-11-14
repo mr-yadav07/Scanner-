@@ -16,12 +16,17 @@ jobs:
         with:
           distribution: temurin
           java-version: '17'
-      - uses: android-actions/setup-android@v3
       - name: Install Android NDK
-        run: sdkmanager --install "ndk;29.0.14206865"
+        env:
+          ANDROID_HOME: /usr/local/lib/android/sdk
+          ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
+        run: |
+          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKMANAGER" --licenses >/dev/null
+          yes | "$SDKMANAGER" --install "ndk;29.0.14206865" "platforms;android-35"
       - name: Build Android ARM64 PRoot runtime
         env:
-          ANDROID_NDK: ${{ env.ANDROID_HOME }}/ndk/29.0.14206865
+          ANDROID_NDK: /usr/local/lib/android/sdk/ndk/29.0.14206865
         run: bash tools/native/build-proot.sh arm64-v8a
       - uses: gradle/actions/setup-gradle@v4
         with:
