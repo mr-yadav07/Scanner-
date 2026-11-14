@@ -1005,14 +1005,20 @@ private fun runOfflineCompile(activity: MainActivity, board: BoardOption, fqbn: 
               mkdir -p "${'$'}cache/build" '${libs}' '${out}'
               for z in '${zipFolder}'/*.zip; do
                 [ -f "${'$'}z" ] || continue
+                zipname="${'$'}(basename "${'$'}z")"
+                marker="${libs}/.espforge-${'$'}zipname.sha256"
+                digest="${'$'}(sha256sum "${'$'}z" | cut -d' ' -f1)"
+                if [ -f "${'$'}marker" ] && [ "${'$'}(cat "${'$'}marker")" = "${'$'}digest" ]; then continue; fi
                 tmp="${'$'}(mktemp -d)"
                 unzip -oq "${'$'}z" -d "${'$'}tmp"
                 prop="${'$'}(find "${'$'}tmp" -name library.properties -print -quit)"
                 if [ -n "${'$'}prop" ]; then
                   src="${'$'}(dirname "${'$'}prop")"
                   libname="${'$'}(basename "${'$'}src")"
-                  if [ ! -d "${libs}/${'$'}libname" ]; then cp -a "${'$'}src" "${libs}/${'$'}libname"; fi
+                  rm -rf "${libs}/${'$'}libname"
+                  cp -a "${'$'}src" "${libs}/${'$'}libname"
                 fi
+                printf '%s' "${'$'}digest" > "${'$'}marker"
                 rm -rf "${'$'}tmp"
               done
               cd '${sketch}'
