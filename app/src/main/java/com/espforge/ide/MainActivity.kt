@@ -331,7 +331,7 @@ private fun ForgeHome(activity: MainActivity, themeMode: String, onThemeChange: 
     var project by remember { mutableStateOf("ESPForgeSketch") }
     var board by remember { mutableStateOf(boards[2]) }
     var fqbn by remember { mutableStateOf(board.fqbn) }
-    var mode by remember { mutableStateOf("Online") }
+    var mode by remember { mutableStateOf(prefs.getString("buildMode", "Offline") ?: "Offline") }
     val defaultSource = "#include <Arduino.h>\n\nvoid setup() {\n  Serial.begin(115200);\n}\n\nvoid loop() {\n}\n"
     var projectFiles by remember { mutableStateOf(loadProjectFiles(prefs, project, defaultSource)) }
     var activeFileName by remember { mutableStateOf("main.ino") }
@@ -535,8 +535,8 @@ private fun ForgeHome(activity: MainActivity, themeMode: String, onThemeChange: 
             }
             OutlinedTextField(fqbn, { fqbn = it }, label = { Text("Board FQBN (advanced)") }, singleLine = true, modifier = Modifier.fillMaxWidth())
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                FilterChip(selected = mode == "Online", onClick = { mode = "Online" }, label = { Text("Online build") })
-                FilterChip(selected = mode == "Offline", onClick = { mode = "Offline" }, label = { Text("Offline build") })
+                FilterChip(selected = mode == "Online", onClick = { mode = "Online"; prefs.edit().putString("buildMode", mode).apply() }, label = { Text("Arduino CLI cloud") })
+                FilterChip(selected = mode == "Offline", onClick = { mode = "Offline"; prefs.edit().putString("buildMode", mode).apply() }, label = { Text("Local build") })
             }
             Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                 listOf("Editor", "Libraries", "Upload", "Serial", "Settings").forEach { item ->
@@ -786,12 +786,12 @@ private fun ForgeHome(activity: MainActivity, themeMode: String, onThemeChange: 
                     }
                     Text("Theme selection is saved on this device.", style = MaterialTheme.typography.bodySmall)
                     Divider()
-                    Text("Online build service")
+                    Text("Arduino CLI cloud build service")
                     OutlinedTextField(endpoint, { endpoint = it }, label = { Text("Build API base URL (e.g. https://your-host)") }, singleLine = true, modifier = Modifier.fillMaxWidth())
                     OutlinedTextField(apiKey, { apiKey = it }, label = { Text("Build API key") }, singleLine = true, modifier = Modifier.fillMaxWidth())
                     Button(onClick = { prefs.edit().putString("endpoint", endpoint.trim()).putString("apiKey", apiKey).apply(); output = "Build service settings saved on this device." }, modifier = Modifier.fillMaxWidth()) { Text("Save online settings") }
                     Divider()
-                    Text("Local compiler prerequisites")
+                    Text("Local compiler · on-device")
                     Text("Local compilation currently runs Arduino CLI inside a Termux Debian environment on this phone. Install Termux, open it once, run termux-setup-storage, enable allow-external-apps=true, then grant ESP Forge the Run commands permission. A fully bundled Android-native toolchain is a separate porting task.")
                     Button(onClick = {
                         val ok = if (board.id == "ch32v003") false else runTermuxSetup(activity, board)
