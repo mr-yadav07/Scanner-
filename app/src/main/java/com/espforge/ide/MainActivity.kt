@@ -358,6 +358,7 @@ private fun ForgeHome(activity: MainActivity, themeMode: String, onThemeChange: 
     }
     var endpoint by remember { mutableStateOf(prefs.getString("endpoint", "") ?: "") }
     var apiKey by remember { mutableStateOf(prefs.getString("apiKey", "") ?: "") }
+    var compileJobs by remember { mutableStateOf(prefs.getInt("compileJobs", 0)) }
     var extraLibraries by remember { mutableStateOf("") }
     var output by remember { mutableStateOf("Ready. Configure the online build API or prepare the offline Termux toolchain.") }
     var tab by remember { mutableStateOf("Editor") }
@@ -614,7 +615,7 @@ private fun ForgeHome(activity: MainActivity, themeMode: String, onThemeChange: 
                             buildLog = "Build requested · $project · ${board.label} · $fqbn\n"
                             scope.launch {
                                 val result = withContext(Dispatchers.IO) {
-                                    compileOnline(activity, endpoint, apiKey, board.id, fqbn, project, projectFiles, extraLibraries) { stage, percent, message, isLog ->
+                                    compileOnline(activity, endpoint, apiKey, board.id, fqbn, project, projectFiles, extraLibraries, compileJobs) { stage, percent, message, isLog ->
                                         activity.runOnUiThread {
                                             buildStage = stage
                                             if (percent >= 0) buildProgress = percent
@@ -641,7 +642,7 @@ private fun ForgeHome(activity: MainActivity, themeMode: String, onThemeChange: 
                             buildProgress = 3
                             output = "Starting local Arduino CLI build in Termux. Live output will appear below."
                             activity.resetOfflineBuildOutput()
-                            val success = if (board.id == "ch32v003") false else runOfflineCompile(activity, board, fqbn, project, projectFiles)
+                            val success = if (board.id == "ch32v003") false else runOfflineCompile(activity, board, fqbn, project, projectFiles, compileJobs)
                             if (success) {
                                 buildStage = "Waiting for Termux"
                                 buildLog = "Termux accepted the build command. Waiting for compiler output…"
@@ -792,6 +793,14 @@ private fun ForgeHome(activity: MainActivity, themeMode: String, onThemeChange: 
                     Button(onClick = { prefs.edit().putString("endpoint", endpoint.trim()).putString("apiKey", apiKey).apply(); output = "Build service settings saved on this device." }, modifier = Modifier.fillMaxWidth()) { Text("Save online settings") }
                     Divider()
                     Text("Local compiler · on-device")
+                    Text("Compiler parallel jobs · ${if (compileJobs == 0) "Auto (all available CPU cores)" else compileJobs.toString()}")
+                    Slider(
+                        value = compileJobs.toFloat(),
+                        onValueChange = { next -> compileJobs = next.toInt(); prefs.edit().putInt("compileJobs", compileJobs).apply() },
+                        valueRange = 0f..8f,
+                        steps = 7
+                    )
+                    Text("Auto maximizes compile throughput. Set 2–4 if Android starts heating or memory becomes tight.", style = MaterialTheme.typography.bodySmall)
                     Text("Local compilation currently runs Arduino CLI inside a Termux Debian environment on this phone. Install Termux, open it once, run termux-setup-storage, enable allow-external-apps=true, then grant ESP Forge the Run commands permission. A fully bundled Android-native toolchain is a separate porting task.")
                     Button(onClick = {
                         val ok = if (board.id == "ch32v003") false else runTermuxSetup(activity, board)
@@ -917,7 +926,7 @@ private fun parseHexAddress(value: String): Int {
 private fun compileOnline(
     activity: MainActivity,
     endpoint: String, apiKey: String, board: String, fqbn: String,
-    project: String, projectFiles: Map<String, String>, libraryText: String,
+    project: String, projectFiles: Map<String, String>, libraryText: String, jobs: Int,
     onUpdate: (String, Int, String, Boolean) -> Unit
 ): Result<ByteArray> = runCatching {
     require(endpoint.startsWith("https://")) { "Use an HTTPS build API URL in Settings." }
@@ -927,7 +936,7 @@ private fun compileOnline(
     val libs = JSONArray()
     libraryText.split(",").map { it.trim() }.filter { it.isNotBlank() }.forEach { libs.put(it) }
     val files = JSONObject(projectFiles)
-    val body = JSONObject().put("board", board).put("fqbn", fqbn).put("project_id", project).put("files", files).put("libraries", libs)
+    val body = JSONObject().put("board", board).put("fqbn", fqbn).put("project_id", project).put("jobs", jobs).put("files", files).put("libraries", libs)
     val url = URL(endpoint.trimEnd('/') + "/v1/compile/stream")
     val conn = (url.openConnection() as HttpURLConnection).apply {
         requestMethod = "POST"
@@ -981,7 +990,7 @@ private fun compileOnline(
     }
 }
 
-private fun runOfflineCompile(activity: MainActivity, board: BoardOption, fqbn: String, project: String, projectFiles: Map<String, String>): Boolean {
+private fun runOfflineCompile(activity: MainActivity, board: BoardOption, fqbn: String, project: String, projectFiles: Map<String, String>, jobs: Int): Boolean {
     return runCatching {
         require(fqbn.matches(Regex("[A-Za-z0-9_.:-]+"))) { "Invalid FQBN" }
         validateProjectFiles(projectFiles)
@@ -1022,7 +1031,7 @@ private fun runOfflineCompile(activity: MainActivity, board: BoardOption, fqbn: 
                 rm -rf "${'$'}tmp"
               done
               cd '${sketch}'
-              if ! arduino-cli compile --fqbn '${fqbn}' ${boardOption} --libraries '${libs}' --build-path "${'$'}cache/build" --output-dir '${out}/artifacts' --jobs 0 . > '${out}/build.log' 2>&1; then cat '${out}/build.log'; exit 1; fi
+              if ! arduino-cli compile --fqbn '${fqbn}' ${boardOption} --libraries '${libs}' --build-path "${'$'}cache/build" --output-dir '${out}/artifacts' --jobs ${jobs} . > '${out}/build.log' 2>&1; then cat '${out}/build.log'; exit 1; fi
               mkdir -p '${out}/package/firmware'
               find '${out}/artifacts' -maxdepth 1 -type f \( -name '*.bin' -o -name '*.hex' -o -name '*.uf2' \) -exec cp {} '${out}/package/firmware/' \;
               count=${'$'}(find '${out}/package/firmware' -type f | wc -l)
