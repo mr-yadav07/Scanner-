@@ -497,14 +497,16 @@ internal class NativeToolchainManager(context: Context) {
             "HOME=/root", "USER=root", "LOGNAME=root", "SHELL=/bin/bash",
             "TERM=xterm-256color", "LANG=C.UTF-8",
             "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-            "TMPDIR=/tmp",
-            "HTTP_PROXY=http://127.0.0.1:" + (activeHttpProxy?.port ?: 0),
-            "HTTPS_PROXY=http://127.0.0.1:" + (activeHttpProxy?.port ?: 0),
-            "http_proxy=http://127.0.0.1:" + (activeHttpProxy?.port ?: 0),
-            "https_proxy=http://127.0.0.1:" + (activeHttpProxy?.port ?: 0),
-            "ALL_PROXY=http://127.0.0.1:" + (activeHttpProxy?.port ?: 0),
-            "NO_PROXY=127.0.0.1,localhost"
+            "TMPDIR=/tmp"
         )
+        activeHttpProxy?.let { proxy ->
+            val proxyUrl = "http://127.0.0.1:${proxy.port}"
+            command += listOf(
+                "HTTP_PROXY=$proxyUrl", "HTTPS_PROXY=$proxyUrl",
+                "http_proxy=$proxyUrl", "https_proxy=$proxyUrl",
+                "ALL_PROXY=$proxyUrl", "NO_PROXY=127.0.0.1,localhost"
+            )
+        }
         command += guestArgs
         val builder = ProcessBuilder(command).redirectErrorStream(true)
         builder.environment().apply {
@@ -625,8 +627,17 @@ private class AndroidHttpProxy : java.io.Closeable {
                 val rewritten = buildString {
                     append(parts[0]).append(' ').append(path).append(' ').append(parts[2]).append("\r\n")
                     headerText.substringAfter("\r\n").split("\r\n").forEach { line ->
-                        if (line.isNotBlank() && !line.startsWith("Proxy-", true)) append(line).append("\r\n")
+                        val headerName = line.substringBefore(':').trim()
+                        if (line.isNotBlank() &&
+                            !line.startsWith("Proxy-", true) &&
+                            !headerName.equals("Connection", true) &&
+                            !headerName.equals("Proxy-Connection", true) &&
+                            !headerName.equals("Keep-Alive", true)
+                        ) append(line).append("\r\n")
                     }
+                    // One request per upstream socket: this keeps APT's HTTP/1.1
+                    // response framing deterministic and prevents idle keep-alive hangs.
+                    append("Connection: close\r\n")
                     append("\r\n")
                 }
                 upstream.getOutputStream().write(rewritten.toByteArray(Charsets.ISO_8859_1))
