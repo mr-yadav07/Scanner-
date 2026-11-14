@@ -484,6 +484,18 @@ private fun ForgeHome(activity: MainActivity, themeMode: String, onThemeChange: 
             buildStage = if (success) "Build succeeded" else "Build failed"
             buildProgress = if (success) 100 else buildProgress
             buildLog = (buildLog + "\n" + activity.offlineBuildOutput).takeLast(24000)
+            if (success) {
+                val builtZip = File("$WORKSPACE/Builds/$project/firmware.zip")
+                runCatching {
+                    if (builtZip.isFile) {
+                        firmwareImages = withContext(Dispatchers.IO) {
+                            readFirmwareImagesFromBytes(builtZip.readBytes(), builtZip.name, board.id, flashAddress)
+                        }
+                        firmwareLabel = "Fresh local build · ${firmwareImages.size} firmware image(s) ready"
+                        output = "Local compilation succeeded. Firmware is ready in Upload."
+                    }
+                }.onFailure { output += "\nUpload preparation failed: ${it.message}" }
+            }
         }
     }
     LaunchedEffect(busy, mode, project) {
@@ -628,7 +640,13 @@ private fun ForgeHome(activity: MainActivity, themeMode: String, onThemeChange: 
                                 busy = false
                                 result.onSuccess { bytes ->
                                     pendingZip = bytes
-                                    output = "Online compilation succeeded. Firmware archive received; save it from the prompt."
+                                    runCatching {
+                                        firmwareImages = withContext(Dispatchers.IO) {
+                                            readFirmwareImagesFromBytes(bytes, "${project}-firmware.zip", board.id, flashAddress)
+                                        }
+                                        firmwareLabel = "Fresh build · ${firmwareImages.size} firmware image(s) ready"
+                                    }.onFailure { firmwareLabel = "Build succeeded; upload preparation failed: ${it.message}" }
+                                    output = "Online compilation succeeded. Firmware is ready in Upload; save the archive if you want a copy."
                                     saveBuildLauncher.launch("${project}-firmware.zip")
                                 }.onFailure {
                                     output = if (cancelRequested) "Build cancelled." else "Online build failed: ${it.message}"
@@ -883,6 +901,10 @@ private fun readFirmwareImages(context: Context, uri: Uri, boardId: String, rawA
     val displayName = queryDisplayName(context, uri).ifBlank { "firmware.bin" }
     val bytes = context.contentResolver.openInputStream(uri)?.use { it.readBytes() }
         ?: throw IllegalArgumentException("Unable to read selected firmware.")
+    return readFirmwareImagesFromBytes(bytes, displayName, boardId, rawAddress)
+}
+
+private fun readFirmwareImagesFromBytes(bytes: ByteArray, displayName: String, boardId: String, rawAddress: String): List<FirmwareImage> {
     if (displayName.endsWith(".zip", true) || (bytes.size >= 2 && bytes[0] == 0x50.toByte() && bytes[1] == 0x4B.toByte())) {
         val entries = mutableListOf<Pair<String, ByteArray>>()
         ZipInputStream(ByteArrayInputStream(bytes)).use { zip ->
