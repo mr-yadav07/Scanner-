@@ -3,7 +3,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from app.main import CompileRequest, CORE_BY_BOARD, DEFAULT_BOARD_OPTIONS, FQBN_BY_BOARD, auto_library_names
+from app.main import CompileRequest, CORE_BY_BOARD, DEFAULT_BOARD_OPTIONS, FQBN_BY_BOARD, app, auto_library_names
 
 
 def test_supported_board_presets_have_core_and_fqbn():
@@ -36,3 +36,86 @@ def test_library_auto_resolution_by_header():
     libraries = [{"name": "Fake NeoPixel", "providesIncludes": ["Adafruit_NeoPixel.h"]}]
     found = auto_library_names({"main.ino": "#include <Adafruit_NeoPixel.h>\nvoid setup(){}"}, libraries, [])
     assert found == ["Fake NeoPixel"]
+
+
+
+def test_streaming_compile_endpoint_is_registered():
+    paths = {route.path for route in app.routes}
+    assert "/v1/compile/stream" in paths
+
+
+
+def test_project_id_is_safe_for_cache_namespace():
+    request = CompileRequest(project_id="my-project_01", board="esp32", files={"main.ino": "void setup(){}"})
+    assert request.project_id == "my-project_01"
+    try:
+        CompileRequest(project_id="../escape", board="esp32", files={"main.ino": "void setup(){}"})
+        assert False
+    except ValueError:
+        pass
+
+
+def test_cached_sketch_preserves_unchanged_source_and_removes_deleted_files(tmp_path):
+    from app.main import sync_cached_sketch
+
+    sketch = tmp_path / "sketch"
+    sketch.mkdir()
+    files = {"main.ino": "void setup(){}\n", "helper.cpp": "int value(){return 1;}\n"}
+    sync_cached_sketch(sketch, files)
+    source = sketch / "main.ino"
+    before = source.stat().st_mtime_ns
+
+    sync_cached_sketch(sketch, files)
+    assert source.stat().st_mtime_ns == before
+
+    sync_cached_sketch(sketch, {"main.ino": "void setup(){ }\n"})
+    assert source.read_text() == "void setup(){ }\n"
+    assert not (sketch / "helper.cpp").exists()
+
+
+
+def test_build_cache_paths_are_stable_and_project_scoped(tmp_path, monkeypatch):
+    import app.main as build_api
+
+    monkeypatch.setattr(build_api, "BUILD_CACHE_DIR", tmp_path)
+    first = CompileRequest(project_id="alpha", board="esp32", files={"main.ino": "void setup(){}"})
+    second = CompileRequest(project_id="beta", board="esp32", files={"main.ino": "void setup(){}"})
+
+    sketch_a, build_a, lock_a = build_api.project_cache_paths(first, "esp32", FQBN_BY_BOARD["esp32"])
+    sketch_a2, build_a2, lock_a2 = build_api.project_cache_paths(first, "esp32", FQBN_BY_BOARD["esp32"])
+    sketch_b, build_b, lock_b = build_api.project_cache_paths(second, "esp32", FQBN_BY_BOARD["esp32"])
+
+    assert (sketch_a, build_a) == (sketch_a2, build_a2)
+    assert lock_a is lock_a2
+    assert sketch_a != sketch_b
+    assert build_a != build_b
+    assert lock_a is not lock_b
+
+
+def test_parallel_jobs_setting_is_bounded():
+    request = CompileRequest(board="esp32", project_id="fast-build", jobs=4, files={"main.ino": "void setup(){}"})
+    assert request.jobs == 4
+    try:
+        CompileRequest(board="esp32", jobs=32, files={"main.ino": "void setup(){}"})
+        assert False
+    except ValueError:
+        pass
+
+
+def test_resource_aware_parallelism_respects_cpu_and_memory():
+    from app.main import resolve_compile_jobs
+
+    # 2 GiB available: ESP32 gets one compiler process after OS headroom.
+    assert resolve_compile_jobs(0, "esp32", cpu_count=8, memory_bytes=2 * 1024**3) == 1
+    # A smaller board can use more workers under the same memory budget.
+    assert resolve_compile_jobs(0, "arduino_uno", cpu_count=8, memory_bytes=4 * 1024**3) == 4
+    # Explicit user settings are respected only up to the safe resource ceiling.
+    assert resolve_compile_jobs(8, "arduino_uno", cpu_count=2, memory_bytes=8 * 1024**3) == 2
+    assert resolve_compile_jobs(0, "esp32", cpu_count=1, memory_bytes=16 * 1024**3) == 1
+
+
+def test_build_queue_is_globally_bounded():
+    from app.main import BUILD_SLOTS, MAX_CONCURRENT_BUILDS
+
+    assert MAX_CONCURRENT_BUILDS >= 1
+    assert isinstance(BUILD_SLOTS, __import__("threading").BoundedSemaphore)

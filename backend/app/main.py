@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import io
 import json
 import os
+import selectors
+import time
 import re
 import shutil
 import subprocess
@@ -27,6 +30,12 @@ DOWNLOAD_DIR = Path(os.getenv("ARDUINO_DIRECTORIES_DOWNLOADS", "/opt/arduino-dow
 CONFIG_FILE = DATA_DIR / "arduino-cli.yaml"
 API_KEY = os.getenv("API_KEY", "")
 CLI_LOCK = threading.Lock()
+BUILD_LOCKS_GUARD = threading.Lock()
+BUILD_LOCKS: dict[str, threading.Lock] = {}
+BUILD_CACHE_DIR = DATA_DIR / "build-cache"
+MAX_CONCURRENT_BUILDS = max(1, min(8, int(os.getenv("ESP_FORGE_MAX_CONCURRENT_BUILDS", "2"))))
+BUILD_QUEUE_TIMEOUT_SECONDS = max(1, int(os.getenv("ESP_FORGE_BUILD_QUEUE_TIMEOUT", "300")))
+BUILD_SLOTS = threading.BoundedSemaphore(MAX_CONCURRENT_BUILDS)
 MAX_PROJECT_BYTES = 350_000
 MAX_FILES = 40
 MAX_BUILD_SECONDS = 900
@@ -78,9 +87,18 @@ app.add_middleware(
 class CompileRequest(BaseModel):
     board: str = Field(min_length=2, max_length=40)
     fqbn: str | None = Field(default=None, max_length=160)
+    project_id: str = Field(default="default", min_length=1, max_length=64)
+    jobs: int = Field(default=0, ge=0, le=16)
     files: Dict[str, str]
     libraries: List[str] = Field(default_factory=list, max_length=40)
     optimize: bool = True
+
+    @field_validator("project_id")
+    @classmethod
+    def validate_project_id(cls, value: str) -> str:
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", value):
+            raise ValueError("Project ID may contain only letters, numbers, underscore and hyphen")
+        return value
 
     @field_validator("files")
     @classmethod
@@ -120,6 +138,53 @@ def run_cli(args: List[str], timeout: int = 300) -> subprocess.CompletedProcess:
     )
 
 
+def available_memory_bytes() -> int | None:
+    """Best-effort memory budget detection for container/cgroup and Linux hosts."""
+    for limit_path, current_path in (
+        (Path("/sys/fs/cgroup/memory.max"), Path("/sys/fs/cgroup/memory.current")),
+        (Path("/sys/fs/cgroup/memory/memory.limit_in_bytes"), Path("/sys/fs/cgroup/memory/memory.usage_in_bytes")),
+    ):
+        try:
+            raw_limit = limit_path.read_text(encoding="utf-8").strip()
+            if raw_limit != "max":
+                limit = int(raw_limit)
+                used = int(current_path.read_text(encoding="utf-8").strip()) if current_path.exists() else 0
+                if 0 < limit < (1 << 60):
+                    return max(0, limit - used)
+        except (OSError, ValueError):
+            pass
+    try:
+        for line in Path("/proc/meminfo").read_text(encoding="utf-8").splitlines():
+            if line.startswith("MemAvailable:"):
+                return int(line.split()[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    try:
+        return int(os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_AVPHYS_PAGES"))
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def resolve_compile_jobs(
+    requested: int,
+    board: str,
+    cpu_count: int | None = None,
+    memory_bytes: int | None = None,
+) -> int:
+    """Cap compiler parallelism by CPU and a conservative per-board RAM budget."""
+    cpus = max(1, cpu_count or os.cpu_count() or 1)
+    memory = available_memory_bytes() if memory_bytes is None else memory_bytes
+    per_job_mib = 1800 if board in {"esp32", "esp32_s3"} else 1300 if board == "esp8266" else 900
+    if memory is None:
+        memory_jobs = max(1, min(2, cpus))
+    else:
+        # Leave 384 MiB for the OS, API process, downloads and packaging.
+        usable_mib = max(512, (memory // (1024 * 1024)) - 384)
+        memory_jobs = max(1, usable_mib // per_job_mib)
+    safe_limit = max(1, min(16, cpus, memory_jobs))
+    return min(requested, safe_limit) if requested > 0 else safe_limit
+
+
 def ensure_cli_config() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     USER_DIR.mkdir(parents=True, exist_ok=True)
@@ -133,6 +198,36 @@ def ensure_cli_config() -> None:
         f"  user: {USER_DIR}\n",
         encoding="utf-8",
     )
+
+
+def project_cache_paths(request: CompileRequest, board: str, fqbn: str):
+    """Return stable sketch/build paths and a per-project lock for incremental builds."""
+    identity = "\\0".join((hashlib.sha256(API_KEY.encode()).hexdigest(), board, fqbn, request.project_id))
+    key = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:32]
+    root = BUILD_CACHE_DIR / key
+    sketch = root / "sketch"
+    build = root / "build"
+    sketch.mkdir(parents=True, exist_ok=True)
+    build.mkdir(parents=True, exist_ok=True)
+    with BUILD_LOCKS_GUARD:
+        lock = BUILD_LOCKS.setdefault(key, threading.Lock())
+    return sketch, build, lock
+
+
+def sync_cached_sketch(sketch: Path, files: Dict[str, str]) -> None:
+    """Keep unchanged files untouched so Arduino's build system can reuse object files."""
+    expected = set()
+    for name, content in files.items():
+        destination = (sketch / name).resolve()
+        if sketch.resolve() not in destination.parents:
+            raise RuntimeError(f"Invalid project path: {name}")
+        expected.add(destination)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if not destination.exists() or destination.read_text(encoding="utf-8") != content:
+            destination.write_text(content, encoding="utf-8")
+    for existing in sketch.rglob("*"):
+        if existing.is_file() and existing.suffix.lower() in {".ino", ".cpp", ".c", ".h", ".hpp"} and existing.resolve() not in expected:
+            existing.unlink()
 
 
 def ensure_core(core: str, log: List[str]) -> None:
@@ -199,11 +294,32 @@ def auto_library_names(files: Dict[str, str], index: list, log: List[str]) -> li
 
 
 def install_libraries(names: List[str], log: List[str]) -> None:
-    for name in sorted(set(names)):
-        p = run_cli(["lib", "install", name], timeout=300)
-        log.append(p.stdout)
-        if p.returncode:
-            raise RuntimeError(f"Library install failed ({name}):\n" + p.stdout[-12000:])
+    requested = sorted(set(names))
+    if not requested:
+        return
+    with CLI_LOCK:
+        installed_names = set()
+        listing = run_cli(["lib", "list", "--json"], timeout=60)
+        if listing.returncode == 0:
+            try:
+                payload = json.loads(listing.stdout or "{}")
+                entries = payload.get("installed_libraries", [])
+                for entry in entries:
+                    library = entry.get("library", entry)
+                    name = library.get("name")
+                    if name:
+                        installed_names.add(name.casefold())
+            except (json.JSONDecodeError, AttributeError, TypeError):
+                log.append("Could not parse installed-library list; verifying requested libraries individually.")
+        missing = [name for name in requested if name.casefold() not in installed_names]
+        if not missing:
+            log.append("All requested Arduino libraries are already installed; reusing local copies.")
+            return
+        for name in missing:
+            p = run_cli(["lib", "install", name], timeout=300)
+            log.append(p.stdout)
+            if p.returncode:
+                raise RuntimeError(f"Library install failed ({name}):\\n" + p.stdout[-12000:])
 
 
 @app.get("/health")
@@ -245,25 +361,25 @@ def compile_project(request: CompileRequest, x_api_key: str | None = Header(defa
 
     logs: List[str] = []
     ensure_cli_config()
+    sketch, build_path, build_lock = project_cache_paths(request, board, fqbn)
     work = Path(tempfile.mkdtemp(prefix="espforge-"))
+    build_lock.acquire()
+    slot_acquired = False
     try:
-        sketch = work / "main"
-        outdir = work / "build"
+        slot_acquired = BUILD_SLOTS.acquire(timeout=BUILD_QUEUE_TIMEOUT_SECONDS)
+        if not slot_acquired:
+            raise HTTPException(status_code=503, detail="Build queue is full. Retry after an active build finishes.")
+        compile_jobs = resolve_compile_jobs(request.jobs, board)
+        outdir = work / "artifacts"
         libsdir = work / "project-libraries"
-        sketch.mkdir()
         outdir.mkdir()
         libsdir.mkdir()
-        for name, content in request.files.items():
-            dest = (sketch / name).resolve()
-            if sketch.resolve() not in dest.parents:
-                raise HTTPException(status_code=400, detail="Invalid project path.")
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            dest.write_text(content, encoding="utf-8")
+        sync_cached_sketch(sketch, request.files)
         ensure_core(CORE_BY_BOARD[board], logs)
         names = set(request.libraries)
         names.update(auto_library_names(request.files, load_library_index(logs), logs))
         install_libraries(list(names), logs)
-        command = ["compile", "--fqbn", fqbn, "--output-dir", str(outdir), "--warnings", "all"]
+        command = ["compile", "--fqbn", fqbn, "--build-path", str(build_path), "--output-dir", str(outdir), "--jobs", str(compile_jobs), "--warnings", "default"]
         for option in DEFAULT_BOARD_OPTIONS.get(board, []):
             command.extend(["--board-options", option])
         command.append(str(sketch))
@@ -294,3 +410,170 @@ def compile_project(request: CompileRequest, x_api_key: str | None = Header(defa
         raise HTTPException(status_code=422, detail=str(exc))
     finally:
         shutil.rmtree(work, ignore_errors=True)
+        if slot_acquired:
+            BUILD_SLOTS.release()
+        build_lock.release()
+
+
+
+@app.post("/v1/compile/stream")
+def compile_project_stream(request: CompileRequest, x_api_key: str | None = Header(default=None)):
+    """Stream truthful build stages and compiler output as newline-delimited SSE data."""
+    if not API_KEY:
+        raise HTTPException(status_code=503, detail="Build service is not configured. Set API_KEY before exposing it.")
+    if x_api_key != API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid build API key.")
+    board = request.board.lower()
+    if board not in CORE_BY_BOARD:
+        raise HTTPException(status_code=400, detail=f"Unsupported board preset: {board}")
+    fqbn = request.fqbn or FQBN_BY_BOARD[board]
+    if not fqbn.startswith(CORE_BY_BOARD[board] + ":") or not re.fullmatch(r"[A-Za-z0-9_.:-]+", fqbn):
+        raise HTTPException(status_code=400, detail="FQBN does not match the selected board family.")
+
+    def stream():
+        sketch, build_path, build_lock = project_cache_paths(request, board, fqbn)
+        build_lock.acquire()
+        slot_acquired = False
+        work = None
+        process = None
+        started = time.monotonic()
+
+        def send(kind: str, **payload):
+            return "data: " + json.dumps({"type": kind, **payload}, ensure_ascii=False) + "\n\n"
+
+        try:
+            yield send("progress", stage="Build queue", progress=1, message=f"Waiting for a build slot (maximum {MAX_CONCURRENT_BUILDS} concurrent builds).")
+            slot_acquired = BUILD_SLOTS.acquire(timeout=BUILD_QUEUE_TIMEOUT_SECONDS)
+            if not slot_acquired:
+                raise TimeoutError("Build queue is full. Retry after an active build finishes.")
+            compile_jobs = resolve_compile_jobs(request.jobs, board)
+            yield send("progress", stage="Build slot acquired", progress=2, message=f"Resource-aware compiler parallelism: {compile_jobs} job(s).")
+            work = Path(tempfile.mkdtemp(prefix="espforge-stream-"))
+            yield send("progress", stage="Preparing project", progress=3, message="Validating source files and preparing workspace.")
+            ensure_cli_config()
+            outdir = work / "artifacts"
+            outdir.mkdir()
+            sync_cached_sketch(sketch, request.files)
+
+            yield send("progress", stage="Board toolchain", progress=10, message=f"Checking/installing {CORE_BY_BOARD[board]}.")
+            setup_logs: List[str] = []
+            ensure_core(CORE_BY_BOARD[board], setup_logs)
+            for item in setup_logs:
+                for line in item.splitlines():
+                    if line.strip():
+                        yield send("log", stage="Board toolchain", message=line)
+
+            yield send("progress", stage="Resolving libraries", progress=30, message="Resolving Arduino Library Manager dependencies.")
+            names = set(request.libraries)
+            names.update(auto_library_names(request.files, load_library_index(setup_logs), setup_logs))
+            for item in setup_logs:
+                for line in item.splitlines():
+                    if line.strip():
+                        yield send("log", stage="Library resolution", message=line)
+            if names:
+                yield send("progress", stage="Installing libraries", progress=42, message="Installing: " + ", ".join(sorted(names)))
+                install_logs: List[str] = []
+                install_libraries(list(names), install_logs)
+                for item in install_logs:
+                    for line in item.splitlines():
+                        if line.strip():
+                            yield send("log", stage="Library installation", message=line)
+            else:
+                yield send("progress", stage="Libraries ready", progress=48, message="No additional libraries required.")
+
+            command = [CLI, "--config-file", str(CONFIG_FILE), "compile", "--fqbn", fqbn,
+                       "--build-path", str(build_path), "--output-dir", str(outdir),
+                       "--jobs", str(compile_jobs), "--warnings", "default"]
+            for option in DEFAULT_BOARD_OPTIONS.get(board, []):
+                command.extend(["--board-options", option])
+            command.append(str(sketch))
+            yield send("progress", stage="Compiling", progress=55,
+                       message="Arduino CLI compiler started. The percentage is stage-based; Arduino CLI does not expose a reliable compile percentage.")
+            process = subprocess.Popen(
+                command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=False, bufsize=0, env=os.environ.copy()
+            )
+            selector = selectors.DefaultSelector()
+            assert process.stdout is not None
+            selector.register(process.stdout, selectors.EVENT_READ)
+            pending = b""
+            compile_log: List[str] = []
+            deadline = time.monotonic() + MAX_BUILD_SECONDS
+            last_heartbeat = time.monotonic()
+            while True:
+                if time.monotonic() > deadline:
+                    process.kill()
+                    raise TimeoutError("Build timed out after 15 minutes.")
+                ready = selector.select(timeout=1.0)
+                if ready:
+                    chunk = os.read(process.stdout.fileno(), 4096)
+                    if not chunk:
+                        break
+                    pending += chunk
+                    while b"\n" in pending:
+                        raw, pending = pending.split(b"\n", 1)
+                        line = raw.decode("utf-8", errors="replace").rstrip("\r")
+                        if line:
+                            compile_log.append(line)
+                            yield send("log", stage="Compiling", message=line)
+                elif process.poll() is not None:
+                    tail = process.stdout.read() or b""
+                    pending += tail
+                    break
+                elif time.monotonic() - last_heartbeat >= 5:
+                    yield send("heartbeat", stage="Compiling", message="Compiler is still running; waiting for the next compiler output.")
+                    last_heartbeat = time.monotonic()
+            if pending.strip():
+                line = pending.decode("utf-8", errors="replace").rstrip("\r")
+                compile_log.append(line)
+                yield send("log", stage="Compiling", message=line)
+            return_code = process.wait(timeout=5)
+            selector.close()
+            process = None
+            if return_code:
+                raise RuntimeError("Compilation failed (exit code " + str(return_code) + "):\n" + "\n".join(compile_log[-400:]))
+
+            yield send("progress", stage="Packaging firmware", progress=92, message="Compilation succeeded. Collecting firmware artifacts.")
+            artifacts = [p for p in outdir.rglob("*") if p.is_file() and p.suffix.lower() in {".bin", ".hex", ".elf", ".eep", ".uf2"}]
+            if not artifacts:
+                raise RuntimeError("Compiler reported success but produced no firmware artifact.")
+            manifest = {
+                "board": board, "fqbn": fqbn,
+                "duration_seconds": round(time.monotonic() - started, 2),
+                "artifacts": [{"name": p.name, "size": p.stat().st_size,
+                               "sha256": hashlib.sha256(p.read_bytes()).hexdigest()} for p in artifacts],
+            }
+            memory = io.BytesIO()
+            with zipfile.ZipFile(memory, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+                archive.writestr("build-manifest.json", json.dumps(manifest, indent=2))
+                archive.writestr("build.log", "\n".join(setup_logs + compile_log))
+                for artifact in artifacts:
+                    archive.write(artifact, f"firmware/{artifact.name}")
+            encoded = base64.b64encode(memory.getvalue()).decode("ascii")
+            yield send("complete", progress=100, stage="Build succeeded",
+                       message=f"Build completed in {manifest['duration_seconds']} seconds.",
+                       archive_base64=encoded, artifacts=manifest["artifacts"],
+                       duration_seconds=manifest["duration_seconds"])
+        except GeneratorExit:
+            raise
+        except Exception as exc:
+            if isinstance(exc, TimeoutError) and process is not None:
+                process.kill()
+            yield send("error", stage="Build failed", message=str(exc))
+        finally:
+            if process is not None and process.poll() is None:
+                process.kill()
+                try:
+                    process.wait(timeout=3)
+                except Exception:
+                    pass
+            if work is not None:
+                shutil.rmtree(work, ignore_errors=True)
+            if slot_acquired:
+                BUILD_SLOTS.release()
+            build_lock.release()
+
+    return StreamingResponse(
+        stream(), media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
+    )

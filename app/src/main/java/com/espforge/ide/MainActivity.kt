@@ -1,6 +1,7 @@
 package com.espforge.ide
 
 import android.app.PendingIntent
+import android.app.ActivityManager
 import android.content.*
 import android.hardware.usb.UsbManager
 import android.hardware.usb.UsbDevice
@@ -10,6 +11,7 @@ import android.os.Bundle
 import android.os.Environment
 import android.provider.MediaStore
 import android.util.Base64
+import android.view.View
 import android.content.ContentValues
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -18,9 +20,12 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import com.hoho.android.usbserial.driver.UsbSerialDriver
@@ -36,6 +41,7 @@ import dev.espflasher.app.usb.UsbSerialTransport
 import com.espforge.ide.upload.Stk500v1Uploader
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
@@ -53,6 +59,13 @@ private const val WORKSPACE = "/storage/emulated/0/Documents/ESPForge"
 private const val LIBRARY_ZIPS = "$WORKSPACE/LibraryZips"
 
 private data class BoardOption(val id: String, val label: String, val fqbn: String, val core: String)
+private data class ArduinoLibraryEntry(
+    val name: String,
+    val version: String,
+    val sentence: String,
+    val author: String,
+    val url: String
+)
 internal data class FlashPermissionResult(val device: UsbDevice, val granted: Boolean)
 private val boards = listOf(
     BoardOption("arduino_uno", "Arduino Uno", "arduino:avr:uno", "arduino:avr"),
@@ -76,6 +89,10 @@ class MainActivity : ComponentActivity() {
     private var pendingDriver: UsbSerialDriver? = null
     @Volatile private var readingSerial = false
     private var requestedBaudRate = 115200
+    @Volatile private var activeBuildConnection: HttpURLConnection? = null
+    fun setActiveBuildConnection(connection: HttpURLConnection?) { activeBuildConnection = connection }
+    fun resetOfflineBuildOutput() { offlineBuildOutput = "" }
+    fun cancelOnlineBuild() { activeBuildConnection?.disconnect() }
 
     private val termuxResultReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
@@ -112,7 +129,47 @@ class MainActivity : ComponentActivity() {
             @Suppress("DEPRECATION") registerReceiver(usbPermissionReceiver, filter)
             @Suppress("DEPRECATION") registerReceiver(termuxResultReceiver, IntentFilter(TermuxResultService.ACTION_TERMUX_RESULT))
         }
-        setContent { MaterialTheme { ForgeHome(this) } }
+        setContent {
+            val themePrefs = getSharedPreferences("espforge", Context.MODE_PRIVATE)
+            var themeMode by remember { mutableStateOf(themePrefs.getString("themeMode", "Light") ?: "Light") }
+            val systemDark = isSystemInDarkTheme()
+            val darkActive = when (themeMode) {
+                "Dark", "AMOLED" -> true
+                "System" -> systemDark
+                else -> false
+            }
+            val colors = when (themeMode) {
+                "Dark" -> darkColorScheme()
+                "AMOLED" -> darkColorScheme(
+                    primary = Color(0xFF90CAF9),
+                    background = Color.Black,
+                    surface = Color.Black,
+                    surfaceVariant = Color(0xFF111111),
+                    onSurface = Color(0xFFECEFF1)
+                )
+                "System" -> if (systemDark) darkColorScheme() else lightColorScheme()
+                else -> lightColorScheme()
+            }
+            SideEffect {
+                val dark = darkActive
+                val barColor = when (themeMode) {
+                    "AMOLED" -> android.graphics.Color.BLACK
+                    "Dark" -> android.graphics.Color.rgb(18, 18, 18)
+                    "System" -> if (systemDark) android.graphics.Color.rgb(18, 18, 18) else android.graphics.Color.WHITE
+                    else -> android.graphics.Color.WHITE
+                }
+                window.statusBarColor = barColor
+                window.navigationBarColor = barColor
+                window.decorView.systemUiVisibility = if (dark) 0 else
+                    (View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR or View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR)
+            }
+            MaterialTheme(colorScheme = colors) {
+                ForgeHome(this, themeMode) { selected ->
+                    themeMode = selected
+                    themePrefs.edit().putString("themeMode", selected).apply()
+                }
+            }
+        }
     }
 
     fun consumeFlashPermission() { flashPermissionResult = null }
@@ -284,20 +341,30 @@ class MainActivity : ComponentActivity() {
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun ForgeHome(activity: MainActivity) {
+private fun ForgeHome(activity: MainActivity, themeMode: String, onThemeChange: (String) -> Unit) {
     val context = LocalContext.current
     val prefs = remember { context.getSharedPreferences("espforge", Context.MODE_PRIVATE) }
     val scope = rememberCoroutineScope()
     var project by remember { mutableStateOf("ESPForgeSketch") }
     var board by remember { mutableStateOf(boards[2]) }
     var fqbn by remember { mutableStateOf(board.fqbn) }
-    var mode by remember { mutableStateOf("Online") }
+    var mode by remember { mutableStateOf(prefs.getString("buildMode", "Offline") ?: "Offline") }
     val defaultSource = "#include <Arduino.h>\n\nvoid setup() {\n  Serial.begin(115200);\n}\n\nvoid loop() {\n}\n"
     var projectFiles by remember { mutableStateOf(loadProjectFiles(prefs, project, defaultSource)) }
     var activeFileName by remember { mutableStateOf("main.ino") }
     fun saveFiles(next: Map<String, String>) {
         projectFiles = next
         prefs.edit().putString("projectFiles:$project", JSONObject(next).toString()).apply()
+    }
+    var removedFiles by remember {
+        mutableStateOf(runCatching {
+            val json = JSONObject(prefs.getString("removedFiles:$project", "{}") ?: "{}")
+            buildMap { json.keys().forEach { key -> put(key, json.getString(key)) } }
+        }.getOrDefault(emptyMap()))
+    }
+    fun saveRemovedFiles(next: Map<String, String>) {
+        removedFiles = next
+        prefs.edit().putString("removedFiles:$project", JSONObject(next).toString()).apply()
     }
     fun addProjectFile(extension: String) {
         val safeExtension = extension.removePrefix(".").lowercase()
@@ -308,13 +375,27 @@ private fun ForgeHome(activity: MainActivity) {
     }
     var endpoint by remember { mutableStateOf(prefs.getString("endpoint", "") ?: "") }
     var apiKey by remember { mutableStateOf(prefs.getString("apiKey", "") ?: "") }
+    var compileJobs by remember { mutableStateOf(prefs.getInt("compileJobs", 0)) }
     var extraLibraries by remember { mutableStateOf("") }
-    var output by remember { mutableStateOf("Ready. Configure the online build API or prepare the offline Termux toolchain.") }
+    var output by remember { mutableStateOf("Select a board, prepare the local toolchain once, then compile locally or use the remote Arduino CLI service.") }
     var tab by remember { mutableStateOf("Editor") }
     var busy by remember { mutableStateOf(false) }
+    var buildProgress by remember { mutableStateOf(0) }
+    var buildStage by remember { mutableStateOf("Idle") }
+    var buildLog by remember { mutableStateOf("") }
+    var buildStartedAt by remember { mutableStateOf(0L) }
+    var buildElapsed by remember { mutableStateOf(0L) }
+    var cancelRequested by remember { mutableStateOf(false) }
+    var renameTarget by remember { mutableStateOf<String?>(null) }
+    var renameValue by remember { mutableStateOf("") }
+    var deleteTarget by remember { mutableStateOf<String?>(null) }
     var pendingZip by remember { mutableStateOf<ByteArray?>(null) }
     var pendingExport by remember { mutableStateOf<File?>(null) }
     var libraryFiles by remember { mutableStateOf(listOf<File>()) }
+    var libraryQuery by remember { mutableStateOf("") }
+    var libraryResults by remember { mutableStateOf(emptyList<ArduinoLibraryEntry>()) }
+    var libraryManagerBusy by remember { mutableStateOf(false) }
+    var libraryManagerMessage by remember { mutableStateOf("Search the official Arduino Library Manager index.") }
     var usbDevices by remember { mutableStateOf(emptyList<UsbDevice>()) }
     var selectedUsbId by remember { mutableStateOf<Int?>(null) }
     var firmwareImages by remember { mutableStateOf(emptyList<FirmwareImage>()) }
@@ -417,11 +498,55 @@ private fun ForgeHome(activity: MainActivity) {
 
     LaunchedEffect(Unit) { refreshLibraries(); refreshUsbDevices() }
     LaunchedEffect(activity.offlineBuildOutput) {
-        if (activity.offlineBuildOutput.isNotBlank()) output = activity.offlineBuildOutput
+        if (activity.offlineBuildOutput.isNotBlank()) {
+            output = activity.offlineBuildOutput
+            busy = false
+            val success = activity.offlineBuildOutput.contains("exit code: 0")
+            buildStage = if (success) "Build succeeded" else "Build failed"
+            buildProgress = if (success) 100 else buildProgress
+            buildLog = (buildLog + "\n" + activity.offlineBuildOutput).takeLast(24000)
+            if (success) {
+                val builtZip = File("$WORKSPACE/Builds/$project/firmware.zip")
+                runCatching {
+                    if (builtZip.isFile) {
+                        firmwareImages = withContext(Dispatchers.IO) {
+                            readFirmwareImagesFromBytes(builtZip.readBytes(), builtZip.name, board.id, flashAddress)
+                        }
+                        firmwareLabel = "Fresh local build · ${firmwareImages.size} firmware image(s) ready"
+                        output = "Local compilation succeeded. Firmware is ready in Upload."
+                    }
+                }.onFailure { output += "\nUpload preparation failed: ${it.message}" }
+            }
+        }
+    }
+    LaunchedEffect(busy, mode, project) {
+        if (busy && mode == "Offline") {
+            val logFile = File("/storage/emulated/0/Documents/ESPForge/Builds/$project/build.log")
+            while (busy && mode == "Offline") {
+                runCatching {
+                    if (logFile.exists()) {
+                        val tail = logFile.readText().takeLast(20000)
+                        if (tail.isNotBlank()) {
+                            buildLog = tail
+                            buildStage = "Compiling · Termux"
+                            buildProgress = maxOf(buildProgress, 55)
+                        }
+                    }
+                }
+                delay(650)
+            }
+        }
+    }
+    LaunchedEffect(busy) {
+        while (busy) {
+            buildElapsed = if (buildStartedAt > 0L) (android.os.SystemClock.elapsedRealtime() - buildStartedAt) / 1000L else 0L
+            delay(500)
+        }
     }
 
     Scaffold(topBar = { TopAppBar(title = { Text("ESP Forge IDE") }, actions = {
-        Text(if (busy) "BUILDING" else "v0.2", style = MaterialTheme.typography.labelMedium, modifier = Modifier.padding(end = 12.dp))
+        TextButton(onClick = { tab = "Settings" }, enabled = !busy) { Text("Settings") }
+        Text(if (busy) "BUILDING" else "v0.4.0", style = MaterialTheme.typography.labelMedium, modifier = Modifier.padding(end = 8.dp))
     }) }) { insets ->
         Column(
             Modifier.padding(insets).fillMaxSize().verticalScroll(rememberScrollState()).padding(14.dp),
@@ -444,10 +569,10 @@ private fun ForgeHome(activity: MainActivity) {
             }
             OutlinedTextField(fqbn, { fqbn = it }, label = { Text("Board FQBN (advanced)") }, singleLine = true, modifier = Modifier.fillMaxWidth())
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                FilterChip(selected = mode == "Online", onClick = { mode = "Online" }, label = { Text("Online build") })
-                FilterChip(selected = mode == "Offline", onClick = { mode = "Offline" }, label = { Text("Offline build") })
+                FilterChip(selected = mode == "Online", onClick = { mode = "Online"; prefs.edit().putString("buildMode", mode).apply() }, label = { Text("Remote Arduino CLI") })
+                FilterChip(selected = mode == "Offline", onClick = { mode = "Offline"; prefs.edit().putString("buildMode", mode).apply() }, label = { Text("Local build") })
             }
-            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                 listOf("Editor", "Libraries", "Upload", "Serial", "Settings").forEach { item ->
                     FilterChip(selected = tab == item, onClick = { tab = item }, label = { Text(item) })
                 }
@@ -459,12 +584,12 @@ private fun ForgeHome(activity: MainActivity) {
                         OutlinedButton(onClick = { projectExportLauncher.launch("${project}-project.zip") }) { Text("Export project") }
                     }
                     Text("Project files · ${projectFiles.size}", style = MaterialTheme.typography.titleSmall)
-                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                         projectFiles.keys.forEach { fileName ->
                             FilterChip(selected = activeFileName == fileName, onClick = { activeFileName = fileName }, label = { Text(fileName) })
                         }
                     }
-                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                         OutlinedButton(onClick = { addProjectFile("h") }) { Text("+ .h") }
                         OutlinedButton(onClick = { addProjectFile("cpp") }) { Text("+ .cpp") }
                         OutlinedButton(onClick = { addProjectFile("c") }) { Text("+ .c") }
@@ -472,10 +597,35 @@ private fun ForgeHome(activity: MainActivity) {
                         TextButton(
                             enabled = activeFileName != "main.ino" && activeFileName in projectFiles,
                             onClick = {
-                                saveFiles(projectFiles - activeFileName)
-                                activeFileName = projectFiles.keys.firstOrNull { it != activeFileName } ?: "main.ino"
+                                val name = activeFileName
+                                saveRemovedFiles(removedFiles + (name to projectFiles.getValue(name)))
+                                saveFiles(projectFiles - name)
+                                activeFileName = projectFiles.keys.firstOrNull() ?: "main.ino"
                             }
+                        ) { Text("Remove") }
+                        TextButton(
+                            enabled = activeFileName != "main.ino" && activeFileName in projectFiles,
+                            onClick = { deleteTarget = activeFileName }
                         ) { Text("Delete") }
+                        TextButton(
+                            enabled = activeFileName != "main.ino" && activeFileName in projectFiles,
+                            onClick = { renameTarget = activeFileName; renameValue = activeFileName }
+                        ) { Text("Rename") }
+                    }
+                    if (removedFiles.isNotEmpty()) {
+                        Text("Removed from project", style = MaterialTheme.typography.titleSmall)
+                        removedFiles.forEach { (name, source) ->
+                            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                                Text(name, modifier = Modifier.weight(1f))
+                                TextButton(onClick = {
+                                    if (name !in projectFiles) {
+                                        saveFiles(projectFiles + (name to source))
+                                        saveRemovedFiles(removedFiles - name)
+                                    }
+                                }) { Text("Restore") }
+                                TextButton(onClick = { saveRemovedFiles(removedFiles - name) }) { Text("Delete permanently") }
+                            }
+                        }
                     }
                     OutlinedTextField(
                         projectFiles[activeFileName].orEmpty(),
@@ -486,37 +636,162 @@ private fun ForgeHome(activity: MainActivity) {
                     )
                     OutlinedTextField(extraLibraries, { extraLibraries = it }, label = { Text("Additional library names (comma separated, optional)") }, minLines = 1, modifier = Modifier.fillMaxWidth())
                     Button(enabled = !busy, onClick = {
+                        cancelRequested = false
+                        buildProgress = 0
+                        buildStage = "Starting"
+                        buildLog = ""
+                        buildStartedAt = android.os.SystemClock.elapsedRealtime()
+                        buildElapsed = 0
                         if (mode == "Online") {
-                            busy = true; output = "Sending sketch to remote Arduino CLI compiler…"
+                            busy = true
+                            output = "Connecting to streaming Arduino CLI compiler…"
+                            buildLog = "Build requested · $project · ${board.label} · $fqbn\n"
                             scope.launch {
                                 val result = withContext(Dispatchers.IO) {
-                                    compileOnline(endpoint, apiKey, board.id, fqbn, project, projectFiles, extraLibraries)
+                                    compileOnline(activity, endpoint, apiKey, board.id, fqbn, project, projectFiles, extraLibraries, compileJobs) { stage, percent, message, isLog ->
+                                        activity.runOnUiThread {
+                                            buildStage = stage
+                                            if (percent >= 0) buildProgress = percent
+                                            if (message.isNotBlank()) {
+                                                buildLog = (buildLog + (if (isLog) message + "\n" else "[$stage] $message\n")).takeLast(24000)
+                                            }
+                                        }
+                                    }
                                 }
                                 busy = false
                                 result.onSuccess { bytes ->
                                     pendingZip = bytes
-                                    output = "Online compilation succeeded. Firmware archive received; save it from the prompt."
+                                    runCatching {
+                                        firmwareImages = withContext(Dispatchers.IO) {
+                                            readFirmwareImagesFromBytes(bytes, "${project}-firmware.zip", board.id, flashAddress)
+                                        }
+                                        firmwareLabel = "Fresh build · ${firmwareImages.size} firmware image(s) ready"
+                                    }.onFailure { firmwareLabel = "Build succeeded; upload preparation failed: ${it.message}" }
+                                    output = "Online compilation succeeded. Firmware is ready in Upload; save the archive if you want a copy."
                                     saveBuildLauncher.launch("${project}-firmware.zip")
-                                }.onFailure { output = "Online build failed: ${it.message}" }
+                                }.onFailure {
+                                    output = if (cancelRequested) "Build cancelled." else "Online build failed: ${it.message}"
+                                    buildStage = if (cancelRequested) "Cancelled" else "Build failed"
+                                    buildLog = (buildLog + "\n" + output).takeLast(24000)
+                                }
                             }
                         } else {
                             busy = true
-                            output = "Starting local Arduino CLI build in Termux. The first build needs the selected board core already installed."
-                            val success = if (board.id == "ch32v003") false else runOfflineCompile(activity, board, fqbn, project, projectFiles)
-                            busy = false
-                            output = if (success) "Offline compile command sent to Termux. The result and firmware.zip are written to Documents/ESPForge/Builds/$project." else if (board.id == "ch32v003") "CH32 toolchain packages currently lack ARM64 Linux compiler binaries, so offline compilation on this Android phone is unavailable. Use Online mode." else "Could not start Termux. Install Termux, allow external apps, grant Run commands permission and run the offline setup first."
+                            buildStage = "Starting Termux"
+                            buildProgress = 3
+                            output = "Starting local Arduino CLI build in Termux. Live output will appear below."
+                            activity.resetOfflineBuildOutput()
+                            val success = if (board.id == "ch32v003") false else runOfflineCompile(activity, board, fqbn, project, projectFiles, compileJobs)
+                            if (success) {
+                                buildStage = "Waiting for local compiler"
+                                buildLog = "Termux accepted the build command. Waiting for compiler output…"
+                                buildProgress = 5
+                                output = "Offline build started. Compiler output is being monitored."
+                            } else {
+                                busy = false
+                                buildStage = "Could not start"
+                                output = if (board.id == "ch32v003") "CH32 toolchain packages currently lack ARM64 Linux compiler binaries, so offline compilation on this Android phone is unavailable. Use Online mode." else "Could not start Termux. Install Termux, allow external apps, grant Run commands permission and run the offline setup first."
+                                buildLog = output
+                            }
                         }
-                    }, modifier = Modifier.fillMaxWidth()) { Text(if (busy) "Working…" else "Compile firmware") }
+                    }, modifier = Modifier.fillMaxWidth()) { Text(if (busy) "Building…" else "Compile firmware") }
+                    if (busy && mode == "Online") {
+                        OutlinedButton(onClick = {
+                            cancelRequested = true
+                            activity.cancelOnlineBuild()
+                        }, modifier = Modifier.fillMaxWidth()) { Text("Cancel build") }
+                    }
+                    if (buildStage != "Idle") {
+                        Text("Build progress · $buildStage", style = MaterialTheme.typography.titleSmall)
+                        LinearProgressIndicator(
+                            progress = { buildProgress.coerceIn(0, 100) / 100f },
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                        Text("$buildProgress% · stage estimate (not exact compiler %) · $buildElapsed s elapsed", style = MaterialTheme.typography.bodySmall)
+                        Surface(color = MaterialTheme.colorScheme.surfaceVariant, modifier = Modifier.fillMaxWidth()) {
+                            Text(buildLog.ifBlank { "Waiting for compiler output…" },
+                                modifier = Modifier.padding(10.dp).heightIn(min = 80.dp, max = 260.dp).verticalScroll(rememberScrollState()),
+                                style = MaterialTheme.typography.bodySmall)
+                        }
+                    }
                 }
                 "Libraries" -> {
-                    Text("Online mode: known #include dependencies are looked up in the Arduino Library Manager index and fetched by the build server. No ZIP upload is needed.")
-                    Text("Offline mode: import ZIP archives once; compile reuses the stored archives after extracting them into the local library directory.")
+                    Text("Arduino Library Manager", style = MaterialTheme.typography.titleMedium)
+                    Text("Search the official Arduino library index. Install downloads a ZIP into ESP Forge's local library store and adds the package to the current build dependencies.")
+                    OutlinedTextField(
+                        libraryQuery,
+                        { libraryQuery = it },
+                        label = { Text("Library name or keyword") },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    Button(
+                        enabled = !libraryManagerBusy && libraryQuery.isNotBlank(),
+                        onClick = {
+                            libraryManagerBusy = true
+                            scope.launch {
+                                val result = runCatching {
+                                    withContext(Dispatchers.IO) { searchArduinoLibraries(context, libraryQuery.trim()) }
+                                }
+                                libraryManagerBusy = false
+                                result.onSuccess {
+                                    libraryResults = it
+                                    libraryManagerMessage = if (it.isEmpty()) "No matching libraries found." else "Found ${it.size} matching libraries."
+                                }.onFailure {
+                                    libraryManagerMessage = "Library search failed: ${it.message}"
+                                }
+                            }
+                        },
+                        modifier = Modifier.fillMaxWidth()
+                    ) { Text(if (libraryManagerBusy) "Searching…" else "Search official library index") }
+                    if (libraryManagerBusy) LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                    Text(libraryManagerMessage, style = MaterialTheme.typography.bodySmall)
+                    libraryResults.forEach { entry ->
+                        Card(modifier = Modifier.fillMaxWidth()) {
+                            Column(Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                                Text(entry.name, style = MaterialTheme.typography.titleSmall)
+                                Text("Version ${entry.version} · ${entry.author}", style = MaterialTheme.typography.bodySmall)
+                                if (entry.sentence.isNotBlank()) Text(entry.sentence, style = MaterialTheme.typography.bodySmall)
+                                Button(
+                                    enabled = !libraryManagerBusy,
+                                    onClick = {
+                                        libraryManagerBusy = true
+                                        scope.launch {
+                                            val result = runCatching {
+                                                withContext(Dispatchers.IO) {
+                                                    val zip = downloadArduinoLibrary(context, entry)
+                                                    copyLibraryFileToSharedFolder(context, zip)
+                                                    zip
+                                                }
+                                            }
+                                            libraryManagerBusy = false
+                                            result.onSuccess { zip ->
+                                                refreshLibraries()
+                                                val deps = (extraLibraries.split(',').map { it.trim() }.filter { it.isNotBlank() } + entry.name).distinct()
+                                                extraLibraries = deps.joinToString(", ")
+                                                libraryManagerMessage = "${entry.name} ${entry.version} installed locally and added to this project's dependencies."
+                                            }.onFailure {
+                                                libraryManagerMessage = "Install failed: ${it.message}"
+                                            }
+                                        }
+                                    }
+                                ) { Text("Install locally + add to project") }
+                            }
+                        }
+                    }
+                    Divider()
+                    Text("Installed library archives · ${libraryFiles.size}", style = MaterialTheme.typography.titleSmall)
                     OutlinedButton(onClick = { importLibraryLauncher.launch(arrayOf("application/zip", "application/x-zip-compressed", "application/octet-stream")) }, modifier = Modifier.fillMaxWidth()) { Text("Import library ZIP") }
-                    if (libraryFiles.isEmpty()) Text("No library ZIPs imported yet.")
+                    if (libraryFiles.isEmpty()) Text("No local library ZIPs installed yet.")
                     libraryFiles.forEach { file ->
                         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
                             Text(file.name, modifier = Modifier.weight(1f))
                             TextButton(onClick = { pendingExport = file; exportLibraryLauncher.launch(file.name) }) { Text("Export") }
+                            TextButton(onClick = {
+                                file.delete()
+                                refreshLibraries()
+                                libraryManagerMessage = "Removed ${file.name} from the local library store."
+                            }) { Text("Remove") }
                         }
                     }
                 }
@@ -611,23 +886,79 @@ private fun ForgeHome(activity: MainActivity) {
                     Text("USB host support depends on phone OTG hardware and adapter compatibility.")
                 }
                 else -> {
-                    Text("Online build service")
+                    Text("Appearance", style = MaterialTheme.typography.titleMedium)
+                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        listOf("System", "Light", "Dark", "AMOLED").forEach { theme ->
+                            FilterChip(selected = themeMode == theme, onClick = { onThemeChange(theme) }, label = { Text(theme) })
+                        }
+                    }
+                    Text("Theme selection is saved on this device.", style = MaterialTheme.typography.bodySmall)
+                    Divider()
+                    Text("Remote Arduino CLI build service")
                     OutlinedTextField(endpoint, { endpoint = it }, label = { Text("Build API base URL (e.g. https://your-host)") }, singleLine = true, modifier = Modifier.fillMaxWidth())
                     OutlinedTextField(apiKey, { apiKey = it }, label = { Text("Build API key") }, singleLine = true, modifier = Modifier.fillMaxWidth())
                     Button(onClick = { prefs.edit().putString("endpoint", endpoint.trim()).putString("apiKey", apiKey).apply(); output = "Build service settings saved on this device." }, modifier = Modifier.fillMaxWidth()) { Text("Save online settings") }
                     Divider()
-                    Text("Offline prerequisites")
-                    Text("Install Termux (F-Droid/GitHub release), open it once, run termux-setup-storage, set allow-external-apps=true in ~/.termux/termux.properties, then grant ESP Forge the 'Run commands in Termux environment' permission.")
+                    Text("Local compiler · on-device")
+                    Text("Compiler parallel jobs · ${if (compileJobs == 0) "Auto (all available CPU cores)" else compileJobs.toString()}")
+                    Slider(
+                        value = compileJobs.toFloat(),
+                        onValueChange = { next -> compileJobs = next.toInt(); prefs.edit().putInt("compileJobs", compileJobs).apply() },
+                        valueRange = 0f..8f,
+                        steps = 7
+                    )
+                    Text("Local builds automatically cap compiler workers by available RAM and CPU, with a maximum of 4 simultaneous compiler processes to reduce overheating and out-of-memory failures. Your selected job count is treated as an upper limit.", style = MaterialTheme.typography.bodySmall)
+                    Text("Local compilation currently runs Arduino CLI inside a Termux Debian environment on this phone. Install Termux, open it once, run termux-setup-storage, enable allow-external-apps=true, then grant ESP Forge the Run commands permission. A fully bundled Android-native toolchain is a separate porting task.")
                     Button(onClick = {
                         val ok = if (board.id == "ch32v003") false else runTermuxSetup(activity, board)
                         output = if (ok) "Termux offline toolchain setup launched. Keep Termux open until downloads and core installation finish." else "Termux setup could not start. Check Termux installation and permissions."
                     }, modifier = Modifier.fillMaxWidth()) { Text("Prepare offline toolchain for selected board") }
-                    Text("Offline setup downloads Linux toolchains once; later builds can run without internet when the selected board core and required libraries are already cached.")
+                    Text("First setup downloads the toolchain once. Subsequent builds reuse the installed core, compiler packages, library folder and persistent per-project build cache. Avoid deleting Build/.build-cache if you want incremental builds.")
                 }
             }
             Text("Build log", style = MaterialTheme.typography.titleMedium)
             Surface(color = MaterialTheme.colorScheme.surfaceVariant, modifier = Modifier.fillMaxWidth()) {
                 Text(output, modifier = Modifier.padding(12.dp), style = MaterialTheme.typography.bodySmall)
+            }
+            renameTarget?.let { target ->
+                AlertDialog(
+                    onDismissRequest = { renameTarget = null },
+                    title = { Text("Rename project file") },
+                    text = {
+                        OutlinedTextField(renameValue, { renameValue = it }, label = { Text("New filename") }, singleLine = true)
+                    },
+                    confirmButton = {
+                        TextButton(onClick = {
+                            val nextName = renameValue.trim()
+                            if (nextName.matches(Regex("[A-Za-z0-9_.-]{1,64}\\.(ino|cpp|c|h|hpp)")) &&
+                                nextName !in projectFiles && target != "main.ino") {
+                                val next = linkedMapOf<String, String>()
+                                projectFiles.forEach { (name, code) -> next[if (name == target) nextName else name] = code }
+                                saveFiles(next)
+                                activeFileName = nextName
+                                renameTarget = null
+                            } else {
+                                output = "Invalid filename or a file with that name already exists."
+                            }
+                        }) { Text("Rename") }
+                    },
+                    dismissButton = { TextButton(onClick = { renameTarget = null }) { Text("Cancel") } }
+                )
+            }
+            deleteTarget?.let { target ->
+                AlertDialog(
+                    onDismissRequest = { deleteTarget = null },
+                    title = { Text("Delete $target permanently?") },
+                    text = { Text("This removes the file and its source from this project. Use Remove instead if you may want to restore it later.") },
+                    confirmButton = {
+                        TextButton(onClick = {
+                            saveFiles(projectFiles - target)
+                            activeFileName = projectFiles.keys.firstOrNull { it != target } ?: "main.ino"
+                            deleteTarget = null
+                        }) { Text("Delete") }
+                    },
+                    dismissButton = { TextButton(onClick = { deleteTarget = null }) { Text("Cancel") } }
+                )
             }
         }
     }
@@ -659,6 +990,10 @@ private fun readFirmwareImages(context: Context, uri: Uri, boardId: String, rawA
     val displayName = queryDisplayName(context, uri).ifBlank { "firmware.bin" }
     val bytes = context.contentResolver.openInputStream(uri)?.use { it.readBytes() }
         ?: throw IllegalArgumentException("Unable to read selected firmware.")
+    return readFirmwareImagesFromBytes(bytes, displayName, boardId, rawAddress)
+}
+
+private fun readFirmwareImagesFromBytes(bytes: ByteArray, displayName: String, boardId: String, rawAddress: String): List<FirmwareImage> {
     if (displayName.endsWith(".zip", true) || (bytes.size >= 2 && bytes[0] == 0x50.toByte() && bytes[1] == 0x4B.toByte())) {
         val entries = mutableListOf<Pair<String, ByteArray>>()
         ZipInputStream(ByteArrayInputStream(bytes)).use { zip ->
@@ -700,8 +1035,10 @@ private fun parseHexAddress(value: String): Int {
 }
 
 private fun compileOnline(
+    activity: MainActivity,
     endpoint: String, apiKey: String, board: String, fqbn: String,
-    project: String, projectFiles: Map<String, String>, libraryText: String
+    project: String, projectFiles: Map<String, String>, libraryText: String, jobs: Int,
+    onUpdate: (String, Int, String, Boolean) -> Unit
 ): Result<ByteArray> = runCatching {
     require(endpoint.startsWith("https://")) { "Use an HTTPS build API URL in Settings." }
     require(apiKey.isNotBlank()) { "Enter the build API key in Settings." }
@@ -710,36 +1047,80 @@ private fun compileOnline(
     val libs = JSONArray()
     libraryText.split(",").map { it.trim() }.filter { it.isNotBlank() }.forEach { libs.put(it) }
     val files = JSONObject(projectFiles)
-    val body = JSONObject().put("board", board).put("fqbn", fqbn).put("files", files).put("libraries", libs)
-    val url = URL(endpoint.trimEnd('/') + "/v1/compile")
+    val body = JSONObject().put("board", board).put("fqbn", fqbn).put("project_id", project).put("jobs", jobs).put("files", files).put("libraries", libs)
+    val url = URL(endpoint.trimEnd('/') + "/v1/compile/stream")
     val conn = (url.openConnection() as HttpURLConnection).apply {
         requestMethod = "POST"
         connectTimeout = 20000
         readTimeout = 900000
         doOutput = true
         setRequestProperty("Content-Type", "application/json")
+        setRequestProperty("Accept", "text/event-stream")
         setRequestProperty("X-API-Key", apiKey)
     }
-    conn.outputStream.use { it.write(body.toString().toByteArray(Charsets.UTF_8)) }
-    val code = conn.responseCode
-    if (code !in 200..299) {
-        val error = (conn.errorStream ?: conn.inputStream).bufferedReader().use { it.readText() }
-        throw IllegalStateException("HTTP $code: $error")
+    activity.setActiveBuildConnection(conn)
+    try {
+        conn.outputStream.use { it.write(body.toString().toByteArray(Charsets.UTF_8)) }
+        val code = conn.responseCode
+        if (code !in 200..299) {
+            val error = (conn.errorStream ?: conn.inputStream).bufferedReader().use { it.readText() }
+            throw IllegalStateException("HTTP $code: $error")
+        }
+        var archive: ByteArray? = null
+        conn.inputStream.bufferedReader(Charsets.UTF_8).use { reader ->
+            while (true) {
+                val line = reader.readLine() ?: break
+                if (!line.startsWith("data: ")) continue
+                val event = JSONObject(line.removePrefix("data: "))
+                val type = event.optString("type")
+                val stage = event.optString("stage", "Building")
+                val percent = event.optInt("progress", -1)
+                val message = event.optString("message", "")
+                when (type) {
+                    "progress" -> onUpdate(stage, percent, message, false)
+                    "log" -> onUpdate(stage, percent, message, true)
+                    "heartbeat" -> onUpdate(stage, percent, message, false)
+                    "error" -> throw IllegalStateException(message.ifBlank { "Compiler failed without an error message." })
+                    "complete" -> {
+                        onUpdate(stage, 100, message, false)
+                        val encoded = event.optString("archive_base64")
+                        require(encoded.isNotBlank()) { "Compiler returned no firmware archive." }
+                        archive = Base64.decode(encoded, Base64.DEFAULT)
+                    }
+                }
+            }
+        }
+        val bytes = archive ?: throw IllegalStateException("Build stream ended before a completion event. Check the build service connection.")
+        require(bytes.size >= 4 && bytes[0] == 0x50.toByte() && bytes[1] == 0x4b.toByte()) {
+            "Build server did not return a valid ZIP firmware archive."
+        }
+        bytes
+    } finally {
+        activity.setActiveBuildConnection(null)
+        conn.disconnect()
     }
-    val bytes = conn.inputStream.use { input ->
-        val out = ByteArrayOutputStream()
-        val buffer = ByteArray(8192)
-        while (true) { val n = input.read(buffer); if (n < 0) break; out.write(buffer, 0, n) }
-        out.toByteArray()
-    }
-    require(bytes.size >= 4 && bytes[0] == 0x50.toByte() && bytes[1] == 0x4b.toByte()) {
-        "Build server did not return a ZIP firmware archive."
-    }
-    conn.disconnect()
-    bytes
 }
 
-private fun runOfflineCompile(activity: MainActivity, board: BoardOption, fqbn: String, project: String, projectFiles: Map<String, String>): Boolean {
+private fun resolveLocalCompileJobs(activity: MainActivity, boardId: String, requested: Int): Int {
+    val cpuCount = Runtime.getRuntime().availableProcessors().coerceAtLeast(1)
+    val activityManager = activity.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
+    val memoryInfo = ActivityManager.MemoryInfo()
+    activityManager.getMemoryInfo(memoryInfo)
+    val availableMiB = (memoryInfo.availMem / (1024L * 1024L)).toInt().coerceAtLeast(512)
+    val reserveMiB = 512
+    val memoryPerCompilerMiB = when (boardId) {
+        "esp32", "esp32_s3" -> 1400
+        "esp8266" -> 950
+        "arduino_uno", "arduino_nano" -> 400
+        else -> 850
+    }
+    val memorySlots = ((availableMiB - reserveMiB) / memoryPerCompilerMiB).coerceAtLeast(1)
+    // Keep sustained phone thermals and UI responsiveness predictable under large builds.
+    val safeMaximum = minOf(cpuCount, memorySlots, 4).coerceAtLeast(1)
+    return if (requested <= 0) safeMaximum else requested.coerceIn(1, safeMaximum)
+}
+
+private fun runOfflineCompile(activity: MainActivity, board: BoardOption, fqbn: String, project: String, projectFiles: Map<String, String>, jobs: Int): Boolean {
     return runCatching {
         require(fqbn.matches(Regex("[A-Za-z0-9_.:-]+"))) { "Invalid FQBN" }
         validateProjectFiles(projectFiles)
@@ -748,40 +1129,63 @@ private fun runOfflineCompile(activity: MainActivity, board: BoardOption, fqbn: 
         val libs = "$WORKSPACE/InstalledLibraries"
         val out = "$WORKSPACE/Builds/$project"
         val zipFolder = "$WORKSPACE/LibraryZips"
+        val effectiveJobs = resolveLocalCompileJobs(activity, board.id, jobs)
         val sourceWriter = projectFiles.entries.joinToString("\n") { (name, text) ->
             val encoded = Base64.encodeToString(text.toByteArray(Charsets.UTF_8), Base64.NO_WRAP)
-            "printf '%s' '$encoded' | base64 -d > '$sketch/$name'"
+            "tmp='$sketch/.$name.tmp'; printf '%s' '$encoded' | base64 -d > \"\$tmp\"; if ! cmp -s \"\$tmp\" '$sketch/$name'; then mv \"\$tmp\" '$sketch/$name'; else rm -f \"\$tmp\"; fi"
         }
+        val expectedSourceFiles = projectFiles.keys.joinToString(" ")
+        val sourceCleanup = """
+            for f in '$sketch'/*.ino '$sketch'/*.cpp '$sketch'/*.c '$sketch'/*.h '$sketch'/*.hpp; do
+              [ -f "${'$'}f" ] || continue
+              case " $expectedSourceFiles " in
+                *" ${'$'}(basename "${'$'}f") "*) ;;
+                *) rm -f "${'$'}f" ;;
+              esac
+            done
+        """.trimIndent()
         val boardOption = when (board.id) { "stm32_bluepill" -> "--board-options pnum=BLUEPILL_F103C8"; "ch32v003" -> "--board-options pnum=CH32V003F4"; else -> "" }
         val script = """
             set -e
-            mkdir -p '$sketch' '$libs' '$out'
+            mkdir -p '$sketch' '$libs' '$out' '$out/artifacts'
+            rm -f '$out/artifacts/'*
             $sourceWriter
+            $sourceCleanup
             proot-distro login --bind /storage:/storage debian -- bash -lc 'set -e
-              mkdir -p '${libs}' '${out}'
-              for z in '${zipFolder}'/*.zip; do
+              cache="${'$'}HOME/.cache/espforge/${project}/${fqbn.replace(':', '_')}"
+              mkdir -p "${'$'}cache/build" "${libs}" "${out}"
+              for z in "${zipFolder}"/*.zip; do
                 [ -f "${'$'}z" ] || continue
+                zipname="${'$'}(basename "${'$'}z")"
+                marker="${libs}/.espforge-${'$'}zipname.sha256"
+                digest="${'$'}(sha256sum "${'$'}z")"
+                digest="${'$'}{digest%% *}"
+                if [ -f "${'$'}marker" ] && [ "${'$'}(cat "${'$'}marker")" = "${'$'}digest" ]; then continue; fi
                 tmp="${'$'}(mktemp -d)"
                 unzip -oq "${'$'}z" -d "${'$'}tmp"
-                prop="${'$'}(find "${'$'}tmp" -name library.properties -print -quit)"
+                prop="${'$'}(find "${'$'}tmp" -name "library.properties" -print -quit)"
                 if [ -n "${'$'}prop" ]; then
                   src="${'$'}(dirname "${'$'}prop")"
-                  cp -a "${'$'}src" "${libs}/${'$'}(basename "${'$'}src")"
+                  libname="${'$'}(basename "${'$'}src")"
+                  rm -rf "${libs}/${'$'}libname"
+                  cp -a "${'$'}src" "${libs}/${'$'}libname"
                 fi
+                printf "%s" "${'$'}digest" > "${'$'}marker"
                 rm -rf "${'$'}tmp"
               done
-              cd '${sketch}'
-              if ! arduino-cli compile --fqbn '${fqbn}' ${boardOption} --libraries '${libs}' --output-dir '${out}' . > '${out}/build.log' 2>&1; then cat '${out}/build.log'; exit 1; fi
-              mkdir -p '${out}/package/firmware'
-              find '${out}' -maxdepth 1 -type f \( -name '*.bin' -o -name '*.hex' -o -name '*.uf2' \) -exec cp {} '${out}/package/firmware/' \;
-              count=${'$'}(find '${out}/package/firmware' -type f | wc -l)
-              [ "${'$'}count" -gt 0 ] || { echo 'No firmware artifacts produced'; exit 2; }
-              printf '{"board":"${board.id}","fqbn":"${fqbn}"}' > '${out}/package/build-manifest.json'
-              cp '${out}/build.log' '${out}/package/build.log'
-              cd '${out}/package'
-              zip -qr '${out}/firmware.zip' firmware build-manifest.json build.log
-              rm -rf '${out}/package'
-              echo 'Build succeeded. Firmware package: ${out}/firmware.zip'
+              cd "${sketch}"
+              echo "ESP Forge resource-aware compiler parallelism: ${effectiveJobs} job(s)" > "${out}/build.log"
+              if ! arduino-cli compile --fqbn "${fqbn}" ${boardOption} --libraries "${libs}" --build-path "${'$'}cache/build" --output-dir "${out}/artifacts" --jobs ${effectiveJobs} . >> "${out}/build.log" 2>&1; then cat "${out}/build.log"; exit 1; fi
+              mkdir -p "${out}/package/firmware"
+              find "${out}/artifacts" -maxdepth 1 -type f \( -name "*.bin" -o -name "*.hex" -o -name "*.uf2" \) -exec cp {} "${out}/package/firmware/" \;
+              count=${'$'}(find "${out}/package/firmware" -type f | wc -l)
+              [ "${'$'}count" -gt 0 ] || { echo "No firmware artifacts produced"; exit 2; }
+              printf "%s" "{\"board\":\"${board.id}\",\"fqbn\":\"${fqbn}\"}" > "${out}/package/build-manifest.json"
+              cp "${out}/build.log" "${out}/package/build.log"
+              cd "${out}/package"
+              zip -qr "${out}/firmware.zip" firmware build-manifest.json build.log
+              rm -rf "${out}/package"
+              echo "Build succeeded. Firmware package: ${out}/firmware.zip"
             '
         """.trimIndent()
         val intent = Intent(TERMUX_ACTION).apply {
@@ -810,16 +1214,19 @@ private fun runTermuxSetup(activity: MainActivity, board: BoardOption): Boolean 
         val core = board.core
         val script = """
             set -e
-            pkg update -y
-            pkg install -y proot-distro
+            if ! command -v proot-distro >/dev/null 2>&1; then pkg update -y; pkg install -y proot-distro; fi
             if [ ! -d "${'$'}PREFIX/var/lib/proot-distro/installed-rootfs/debian" ]; then proot-distro install debian; fi
             proot-distro login debian -- bash -lc 'set -e
-              apt-get update
-              apt-get install -y curl ca-certificates unzip zip python3
+              if ! command -v curl >/dev/null 2>&1 || ! command -v unzip >/dev/null 2>&1 || ! command -v zip >/dev/null 2>&1; then
+                apt-get update
+                apt-get install -y curl ca-certificates unzip zip python3
+              fi
               arch="${'$'}(dpkg --print-architecture)"
               if [ "${'$'}arch" = "arm64" ]; then asset="Linux_ARM64"; elif [ "${'$'}arch" = "amd64" ]; then asset="Linux_64bit"; else echo "Unsupported Debian architecture: ${'$'}arch"; exit 2; fi
-              curl -fsSL "https://downloads.arduino.cc/arduino-cli/arduino-cli_1.5.1_${'$'}{asset}.tar.gz" -o /tmp/arduino-cli.tar.gz
-              tar -xzf /tmp/arduino-cli.tar.gz -C /usr/local/bin arduino-cli
+              if [ ! -x /usr/local/bin/arduino-cli ]; then
+                curl -fsSL "https://downloads.arduino.cc/arduino-cli/arduino-cli_1.5.1_${'$'}{asset}.tar.gz" -o /tmp/arduino-cli.tar.gz
+                tar -xzf /tmp/arduino-cli.tar.gz -C /usr/local/bin arduino-cli
+              fi
               mkdir -p /root/.arduino15
               cat > /root/.arduino15/arduino-cli.yaml <<EOF
 board_manager:
@@ -829,9 +1236,13 @@ board_manager:
     - https://github.com/stm32duino/BoardManagerFiles/raw/main/package_stmicroelectronics_index.json
     - https://github.com/openwch/board_manager_files/raw/main/package_ch32v_index.json
 EOF
-              arduino-cli core update-index
-              arduino-cli core install '${core}'
-              echo "Offline toolchain installed for ${fqbn}"
+              if ! arduino-cli core list --format json | grep -Eq "\"id\"[[:space:]]*:[[:space:]]*\"${core}\""; then
+                arduino-cli core update-index
+                arduino-cli core install "${core}"
+              else
+                echo "Cached board core already installed: ${core}"
+              fi
+              echo "Local toolchain ready for ${fqbn}"
             '
         """.trimIndent()
         val intent = Intent(TERMUX_ACTION).apply {
@@ -869,4 +1280,136 @@ private fun copyToSharedLibraryFolder(context: Context, source: Uri, name: Strin
     }
     val ready = ContentValues().apply { put(MediaStore.MediaColumns.IS_PENDING, 0) }
     context.contentResolver.update(uri, ready, null, null)
+}
+
+
+
+private fun searchArduinoLibraries(context: Context, query: String): List<ArduinoLibraryEntry> {
+    require(query.length in 2..80) { "Enter at least 2 characters." }
+    val cache = File(context.cacheDir, "arduino-library-index.json")
+    if (!cache.exists() || System.currentTimeMillis() - cache.lastModified() > 12L * 60L * 60L * 1000L) {
+        val connection = URL("https://downloads.arduino.cc/libraries/library_index.json").openConnection() as HttpURLConnection
+        connection.connectTimeout = 15000
+        connection.readTimeout = 45000
+        connection.setRequestProperty("User-Agent", "ESP-Forge-IDE")
+        try {
+            connection.connect()
+            require(connection.responseCode in 200..299) { "Arduino Library Manager returned HTTP ${connection.responseCode}." }
+            val temp = File(cache.parentFile, cache.name + ".tmp")
+            connection.inputStream.use { input ->
+                temp.outputStream().buffered().use { output ->
+                    val buffer = ByteArray(32 * 1024)
+                    var total = 0L
+                    while (true) {
+                        val count = input.read(buffer)
+                        if (count < 0) break
+                        total += count
+                        require(total <= 80L * 1024L * 1024L) { "Library index exceeds the 80 MiB safety limit." }
+                        output.write(buffer, 0, count)
+                    }
+                }
+            }
+            if (!temp.renameTo(cache)) {
+                temp.copyTo(cache, overwrite = true)
+                temp.delete()
+            }
+        } finally {
+            connection.disconnect()
+        }
+    }
+
+    val records = JSONObject(cache.readText(Charsets.UTF_8)).optJSONArray("libraries") ?: JSONArray()
+    val latest = linkedMapOf<String, ArduinoLibraryEntry>()
+    for (i in 0 until records.length()) {
+        val item = records.optJSONObject(i) ?: continue
+        val name = item.optString("name").trim()
+        val version = item.optString("version").trim()
+        val url = item.optString("url").trim()
+        if (name.isBlank() || version.isBlank() || !url.startsWith("https://")) continue
+        val candidate = ArduinoLibraryEntry(
+            name = name,
+            version = version,
+            sentence = item.optString("sentence"),
+            author = item.optString("author"),
+            url = url
+        )
+        val previous = latest[name]
+        if (previous == null || compareArduinoVersions(candidate.version, previous.version) > 0) {
+            latest[name] = candidate
+        }
+    }
+    return latest.values.asSequence()
+        .filter { it.name.contains(query, ignoreCase = true) || it.sentence.contains(query, ignoreCase = true) || it.author.contains(query, ignoreCase = true) }
+        .sortedWith(compareBy<ArduinoLibraryEntry> { !it.name.startsWith(query, ignoreCase = true) }.thenBy { it.name.lowercase() })
+        .take(25)
+        .toList()
+}
+
+private fun compareArduinoVersions(first: String, second: String): Int {
+    val a = Regex("\\d+").findAll(first).mapNotNull { it.value.toIntOrNull() }.toList()
+    val b = Regex("\\d+").findAll(second).mapNotNull { it.value.toIntOrNull() }.toList()
+    for (index in 0 until maxOf(a.size, b.size)) {
+        val left = a.getOrElse(index) { 0 }
+        val right = b.getOrElse(index) { 0 }
+        if (left != right) return left.compareTo(right)
+    }
+    return first.compareTo(second, ignoreCase = true)
+}
+
+private fun downloadArduinoLibrary(context: Context, entry: ArduinoLibraryEntry): File {
+    val safe = (entry.name + "-" + entry.version).replace(Regex("[^A-Za-z0-9_.-]"), "_")
+    val directory = File(context.filesDir, "library-zips").apply { mkdirs() }
+    val target = File(directory, "$safe.zip")
+    if (target.isFile && target.length() > 0L) return target
+    val connection = URL(entry.url).openConnection() as HttpURLConnection
+    connection.connectTimeout = 15000
+    connection.readTimeout = 60000
+    connection.instanceFollowRedirects = true
+    try {
+        connection.connect()
+        require(connection.responseCode in 200..299) { "Library download failed with HTTP ${connection.responseCode}." }
+        val temp = File(directory, "$safe.zip.part")
+        connection.inputStream.use { input ->
+            temp.outputStream().buffered().use { output ->
+                val buffer = ByteArray(32 * 1024)
+                var total = 0L
+                while (true) {
+                    val count = input.read(buffer)
+                    if (count < 0) break
+                    total += count
+                    require(total <= 64L * 1024L * 1024L) { "Library archive exceeds the 64 MiB safety limit." }
+                    output.write(buffer, 0, count)
+                }
+            }
+        }
+        require(temp.length() > 22L) { "Downloaded library archive is empty or invalid." }
+        if (!temp.renameTo(target)) {
+            temp.copyTo(target, overwrite = true)
+            temp.delete()
+        }
+        return target
+    } finally {
+        connection.disconnect()
+    }
+}
+
+private fun copyLibraryFileToSharedFolder(context: Context, file: File) {
+    require(Build.VERSION.SDK_INT >= 29) { "Android 10 or newer is required for local compiler library storage." }
+    val values = ContentValues().apply {
+        put(MediaStore.MediaColumns.DISPLAY_NAME, file.name)
+        put(MediaStore.MediaColumns.MIME_TYPE, "application/zip")
+        put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOCUMENTS + "/ESPForge/LibraryZips/")
+        put(MediaStore.MediaColumns.IS_PENDING, 1)
+    }
+    val uri = context.contentResolver.insert(MediaStore.Files.getContentUri("external"), values)
+        ?: throw IllegalStateException("Could not copy the library to the compiler library folder.")
+    try {
+        context.contentResolver.openOutputStream(uri)?.use { output -> file.inputStream().use { it.copyTo(output) } }
+            ?: throw IllegalStateException("Could not open the compiler library destination.")
+        val complete = ContentValues().apply { put(MediaStore.MediaColumns.IS_PENDING, 0) }
+        context.contentResolver.update(uri, complete, null, null)
+    } catch (error: Exception) {
+        context.contentResolver.delete(uri, null, null)
+        throw error
+    }
 }
