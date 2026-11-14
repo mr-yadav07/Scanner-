@@ -54,9 +54,6 @@ import java.util.zip.ZipInputStream
 
 private const val USB_PERMISSION_ACTION = "com.espforge.ide.USB_PERMISSION"
 private const val FLASH_USB_PERMISSION_ACTION = "com.espforge.ide.FLASH_USB_PERMISSION"
-private const val TERMUX_ACTION = "com.termux.RUN_COMMAND"
-private const val WORKSPACE = "/storage/emulated/0/Documents/ESPForge"
-private const val LIBRARY_ZIPS = "$WORKSPACE/LibraryZips"
 
 private data class BoardOption(val id: String, val label: String, val fqbn: String, val core: String)
 private data class ArduinoLibraryEntry(
@@ -82,25 +79,18 @@ class MainActivity : ComponentActivity() {
         private set
     var serialText by mutableStateOf("")
         private set
-    var offlineBuildOutput by mutableStateOf("")
-        private set
     internal var flashPermissionResult by mutableStateOf<FlashPermissionResult?>(null)
     private var serialPort: UsbSerialPort? = null
     private var pendingDriver: UsbSerialDriver? = null
     @Volatile private var readingSerial = false
     private var requestedBaudRate = 115200
     @Volatile private var activeBuildConnection: HttpURLConnection? = null
-    fun setActiveBuildConnection(connection: HttpURLConnection?) { activeBuildConnection = connection }
-    fun resetOfflineBuildOutput() { offlineBuildOutput = "" }
-    fun cancelOnlineBuild() { activeBuildConnection?.disconnect() }
-
-    private val termuxResultReceiver = object : BroadcastReceiver() {
-        override fun onReceive(context: Context, intent: Intent) {
-            if (intent.action == TermuxResultService.ACTION_TERMUX_RESULT) {
-                offlineBuildOutput = intent.getStringExtra(TermuxResultService.EXTRA_OUTPUT).orEmpty()
-            }
-        }
+    internal val nativeToolchain by lazy(LazyThreadSafetyMode.SYNCHRONIZED) {
+        NativeToolchainManager(this)
     }
+    fun setActiveBuildConnection(connection: HttpURLConnection?) { activeBuildConnection = connection }
+    fun cancelOnlineBuild() { activeBuildConnection?.disconnect() }
+    fun cancelLocalBuild() { nativeToolchain.cancel() }
 
     private val usbPermissionReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
@@ -123,11 +113,9 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         val filter = IntentFilter().apply { addAction(USB_PERMISSION_ACTION); addAction(FLASH_USB_PERMISSION_ACTION) }
         if (Build.VERSION.SDK_INT >= 33) {
-            registerReceiver(usbPermissionReceiver, filter, RECEIVER_NOT_EXPORTED)
-            registerReceiver(termuxResultReceiver, IntentFilter(TermuxResultService.ACTION_TERMUX_RESULT), RECEIVER_NOT_EXPORTED)
+            registerReceiver(usbPermissionReceiver, filter)
         } else {
             @Suppress("DEPRECATION") registerReceiver(usbPermissionReceiver, filter)
-            @Suppress("DEPRECATION") registerReceiver(termuxResultReceiver, IntentFilter(TermuxResultService.ACTION_TERMUX_RESULT))
         }
         setContent {
             val themePrefs = getSharedPreferences("espforge", Context.MODE_PRIVATE)
@@ -334,7 +322,7 @@ class MainActivity : ComponentActivity() {
     override fun onDestroy() {
         closeSerial()
         try { unregisterReceiver(usbPermissionReceiver) } catch (_: Exception) {}
-        try { unregisterReceiver(termuxResultReceiver) } catch (_: Exception) {}
+        nativeToolchain.cancel()
         super.onDestroy()
     }
 }
@@ -497,46 +485,6 @@ private fun ForgeHome(activity: MainActivity, themeMode: String, onThemeChange: 
     }
 
     LaunchedEffect(Unit) { refreshLibraries(); refreshUsbDevices() }
-    LaunchedEffect(activity.offlineBuildOutput) {
-        if (activity.offlineBuildOutput.isNotBlank()) {
-            output = activity.offlineBuildOutput
-            busy = false
-            val success = activity.offlineBuildOutput.contains("exit code: 0")
-            buildStage = if (success) "Build succeeded" else "Build failed"
-            buildProgress = if (success) 100 else buildProgress
-            buildLog = (buildLog + "\n" + activity.offlineBuildOutput).takeLast(24000)
-            if (success) {
-                val builtZip = File("$WORKSPACE/Builds/$project/firmware.zip")
-                runCatching {
-                    if (builtZip.isFile) {
-                        firmwareImages = withContext(Dispatchers.IO) {
-                            readFirmwareImagesFromBytes(builtZip.readBytes(), builtZip.name, board.id, flashAddress)
-                        }
-                        firmwareLabel = "Fresh local build · ${firmwareImages.size} firmware image(s) ready"
-                        output = "Local compilation succeeded. Firmware is ready in Upload."
-                    }
-                }.onFailure { output += "\nUpload preparation failed: ${it.message}" }
-            }
-        }
-    }
-    LaunchedEffect(busy, mode, project) {
-        if (busy && mode == "Offline") {
-            val logFile = File("/storage/emulated/0/Documents/ESPForge/Builds/$project/build.log")
-            while (busy && mode == "Offline") {
-                runCatching {
-                    if (logFile.exists()) {
-                        val tail = logFile.readText().takeLast(20000)
-                        if (tail.isNotBlank()) {
-                            buildLog = tail
-                            buildStage = "Compiling · Termux"
-                            buildProgress = maxOf(buildProgress, 55)
-                        }
-                    }
-                }
-                delay(650)
-            }
-        }
-    }
     LaunchedEffect(busy) {
         while (busy) {
             buildElapsed = if (buildStartedAt > 0L) (android.os.SystemClock.elapsedRealtime() - buildStartedAt) / 1000L else 0L
@@ -676,29 +624,85 @@ private fun ForgeHome(activity: MainActivity, themeMode: String, onThemeChange: 
                                 }
                             }
                         } else {
+                            val selectedBoard = board
+                            val selectedFqbn = fqbn
+                            val selectedProject = project
+                            val selectedFiles = projectFiles.toMap()
+                            val selectedLibraries = libraryFiles.toList()
+                            val selectedJobs = resolveLocalCompileJobs(activity, selectedBoard.id, compileJobs)
+                            val boardOption = when (selectedBoard.id) {
+                                "stm32_bluepill" -> "pnum=BLUEPILL_F103C8"
+                                else -> null
+                            }
+                            cancelRequested = false
                             busy = true
-                            buildStage = "Starting Termux"
-                            buildProgress = 3
-                            output = "Starting local Arduino CLI build in Termux. Live output will appear below."
-                            activity.resetOfflineBuildOutput()
-                            val success = if (board.id == "ch32v003") false else runOfflineCompile(activity, board, fqbn, project, projectFiles, compileJobs)
-                            if (success) {
-                                buildStage = "Waiting for local compiler"
-                                buildLog = "Termux accepted the build command. Waiting for compiler output…"
-                                buildProgress = 5
-                                output = "Offline build started. Compiler output is being monitored."
-                            } else {
-                                busy = false
-                                buildStage = "Could not start"
-                                output = if (board.id == "ch32v003") "CH32 toolchain packages currently lack ARM64 Linux compiler binaries, so offline compilation on this Android phone is unavailable. Use Online mode." else "Could not start Termux. Install Termux, allow external apps, grant Run commands permission and run the offline setup first."
-                                buildLog = output
+                            buildStage = "Preparing app-managed runtime"
+                            buildProgress = 2
+                            buildStartedAt = android.os.SystemClock.elapsedRealtime()
+                            buildLog = "Starting the compiler runtime inside ESP Forge…"
+                            output = "Preparing the local ARM64 compiler. Termux is not required."
+                            scope.launch {
+                                try {
+                                    val compiled = withContext(Dispatchers.IO) {
+                                        activity.nativeToolchain.compile(
+                                            boardId = selectedBoard.id,
+                                            core = selectedBoard.core,
+                                            fqbn = selectedFqbn,
+                                            boardOption = boardOption,
+                                            project = selectedProject,
+                                            files = selectedFiles,
+                                            libraryZips = selectedLibraries,
+                                            jobs = selectedJobs
+                                        ) { line ->
+                                            activity.runOnUiThread {
+                                                buildLog = (buildLog + "\n" + line).takeLast(24000)
+                                                buildStage = when {
+                                                    line.contains("Installing", true) -> "Installing toolchain"
+                                                    line.contains("Updating", true) || line.contains("Downloading", true) -> "Downloading toolchain"
+                                                    line.contains("Compiling", true) -> "Compiling"
+                                                    line.contains("succeeded", true) -> "Packaging firmware"
+                                                    else -> "Preparing local build"
+                                                }
+                                                buildProgress = when (buildStage) {
+                                                    "Downloading toolchain" -> maxOf(buildProgress, 18)
+                                                    "Installing toolchain" -> maxOf(buildProgress, 38)
+                                                    "Compiling" -> maxOf(buildProgress, 65)
+                                                    "Packaging firmware" -> maxOf(buildProgress, 92)
+                                                    else -> maxOf(buildProgress, 5)
+                                                }
+                                            }
+                                        }
+                                    }
+                                    pendingZip = compiled.archive
+                                    firmwareImages = withContext(Dispatchers.IO) {
+                                        readFirmwareImagesFromBytes(
+                                            compiled.archive,
+                                            "${selectedProject}-firmware.zip",
+                                            selectedBoard.id,
+                                            flashAddress
+                                        )
+                                    }
+                                    firmwareLabel = "Fresh local build · ${firmwareImages.size} firmware image(s) ready"
+                                    buildLog = (buildLog + "\n" + compiled.log).takeLast(24000)
+                                    buildProgress = 100
+                                    buildStage = "Build succeeded"
+                                    output = "Local compilation succeeded. Firmware is ready in Upload."
+                                    saveBuildLauncher.launch("${selectedProject}-firmware.zip")
+                                } catch (error: Exception) {
+                                    buildStage = if (cancelRequested) "Cancelled" else "Build failed"
+                                    output = if (cancelRequested) "Local build cancelled." else "Local build failed: ${error.message}"
+                                    buildLog = (buildLog + "\n" + output).takeLast(24000)
+                                } finally {
+                                    busy = false
+                                }
                             }
                         }
                     }, modifier = Modifier.fillMaxWidth()) { Text(if (busy) "Building…" else "Compile firmware") }
-                    if (busy && mode == "Online") {
+                    if (busy) {
                         OutlinedButton(onClick = {
                             cancelRequested = true
                             activity.cancelOnlineBuild()
+                            activity.cancelLocalBuild()
                         }, modifier = Modifier.fillMaxWidth()) { Text("Cancel build") }
                     }
                     if (buildStage != "Idle") {
@@ -908,11 +912,44 @@ private fun ForgeHome(activity: MainActivity, themeMode: String, onThemeChange: 
                         steps = 7
                     )
                     Text("Local builds automatically cap compiler workers by available RAM and CPU, with a maximum of 4 simultaneous compiler processes to reduce overheating and out-of-memory failures. Your selected job count is treated as an upper limit.", style = MaterialTheme.typography.bodySmall)
-                    Text("Local compilation currently runs Arduino CLI inside a Termux Debian environment on this phone. Install Termux, open it once, run termux-setup-storage, enable allow-external-apps=true, then grant ESP Forge the Run commands permission. A fully bundled Android-native toolchain is a separate porting task.")
-                    Button(onClick = {
-                        val ok = if (board.id == "ch32v003") false else runTermuxSetup(activity, board)
-                        output = if (ok) "Termux offline toolchain setup launched. Keep Termux open until downloads and core installation finish." else "Termux setup could not start. Check Termux installation and permissions."
-                    }, modifier = Modifier.fillMaxWidth()) { Text("Prepare offline toolchain for selected board") }
+                    Text("Local builds run inside ESP Forge using an app-managed ARM64 Linux toolchain. No Termux installation or separate terminal app is required. Linux board tools run in a private runtime because vendor toolchains are distributed for Linux ARM64, not Android/Bionic.")
+                    Button(
+                        enabled = !busy && activity.nativeToolchain.supportsLocalBoard(board.id),
+                        onClick = {
+                            val selectedBoard = board
+                            val selectedFqbn = fqbn
+                            busy = true
+                            buildStage = "Preparing local runtime"
+                            buildProgress = 3
+                            buildLog = ""
+                            output = "Preparing the private compiler runtime and selected board packages…"
+                            scope.launch {
+                                try {
+                                    withContext(Dispatchers.IO) {
+                                        activity.nativeToolchain.prepareBoard(
+                                            selectedBoard.id,
+                                            selectedBoard.core,
+                                            selectedFqbn
+                                        ) { line ->
+                                            activity.runOnUiThread {
+                                                buildLog = (buildLog + "\n" + line).takeLast(24000)
+                                            }
+                                        }
+                                    }
+                                    buildStage = "Toolchain ready"
+                                    buildProgress = 100
+                                    output = "Local toolchain is ready for ${selectedFqbn}."
+                                } catch (error: Exception) {
+                                    buildStage = "Toolchain setup failed"
+                                    output = "Local toolchain setup failed: ${error.message}"
+                                    buildLog = (buildLog + "\n" + output).takeLast(24000)
+                                } finally {
+                                    busy = false
+                                }
+                            }
+                        },
+                        modifier = Modifier.fillMaxWidth()
+                    ) { Text(if (activity.nativeToolchain.supportsLocalBoard(board.id)) "Prepare local toolchain" else "CH32V003 · Remote build only") }
                     Text("First setup downloads the toolchain once. Subsequent builds reuse the installed core, compiler packages, library folder and persistent per-project build cache. Avoid deleting Build/.build-cache if you want incremental builds.")
                 }
             }
@@ -1118,144 +1155,6 @@ private fun resolveLocalCompileJobs(activity: MainActivity, boardId: String, req
     // Keep sustained phone thermals and UI responsiveness predictable under large builds.
     val safeMaximum = minOf(cpuCount, memorySlots, 4).coerceAtLeast(1)
     return if (requested <= 0) safeMaximum else requested.coerceIn(1, safeMaximum)
-}
-
-private fun runOfflineCompile(activity: MainActivity, board: BoardOption, fqbn: String, project: String, projectFiles: Map<String, String>, jobs: Int): Boolean {
-    return runCatching {
-        require(fqbn.matches(Regex("[A-Za-z0-9_.:-]+"))) { "Invalid FQBN" }
-        validateProjectFiles(projectFiles)
-        require(projectFiles.containsKey("main.ino")) { "main.ino is required." }
-        val sketch = "$WORKSPACE/Projects/$project"
-        val libs = "$WORKSPACE/InstalledLibraries"
-        val out = "$WORKSPACE/Builds/$project"
-        val zipFolder = "$WORKSPACE/LibraryZips"
-        val effectiveJobs = resolveLocalCompileJobs(activity, board.id, jobs)
-        val sourceWriter = projectFiles.entries.joinToString("\n") { (name, text) ->
-            val encoded = Base64.encodeToString(text.toByteArray(Charsets.UTF_8), Base64.NO_WRAP)
-            "tmp='$sketch/.$name.tmp'; printf '%s' '$encoded' | base64 -d > \"\$tmp\"; if ! cmp -s \"\$tmp\" '$sketch/$name'; then mv \"\$tmp\" '$sketch/$name'; else rm -f \"\$tmp\"; fi"
-        }
-        val expectedSourceFiles = projectFiles.keys.joinToString(" ")
-        val sourceCleanup = """
-            for f in '$sketch'/*.ino '$sketch'/*.cpp '$sketch'/*.c '$sketch'/*.h '$sketch'/*.hpp; do
-              [ -f "${'$'}f" ] || continue
-              case " $expectedSourceFiles " in
-                *" ${'$'}(basename "${'$'}f") "*) ;;
-                *) rm -f "${'$'}f" ;;
-              esac
-            done
-        """.trimIndent()
-        val boardOption = when (board.id) { "stm32_bluepill" -> "--board-options pnum=BLUEPILL_F103C8"; "ch32v003" -> "--board-options pnum=CH32V003F4"; else -> "" }
-        val script = """
-            set -e
-            mkdir -p '$sketch' '$libs' '$out' '$out/artifacts'
-            rm -f '$out/artifacts/'*
-            $sourceWriter
-            $sourceCleanup
-            proot-distro login --bind /storage:/storage debian -- bash -lc 'set -e
-              cache="${'$'}HOME/.cache/espforge/${project}/${fqbn.replace(':', '_')}"
-              mkdir -p "${'$'}cache/build" "${libs}" "${out}"
-              for z in "${zipFolder}"/*.zip; do
-                [ -f "${'$'}z" ] || continue
-                zipname="${'$'}(basename "${'$'}z")"
-                marker="${libs}/.espforge-${'$'}zipname.sha256"
-                digest="${'$'}(sha256sum "${'$'}z")"
-                digest="${'$'}{digest%% *}"
-                if [ -f "${'$'}marker" ] && [ "${'$'}(cat "${'$'}marker")" = "${'$'}digest" ]; then continue; fi
-                tmp="${'$'}(mktemp -d)"
-                unzip -oq "${'$'}z" -d "${'$'}tmp"
-                prop="${'$'}(find "${'$'}tmp" -name "library.properties" -print -quit)"
-                if [ -n "${'$'}prop" ]; then
-                  src="${'$'}(dirname "${'$'}prop")"
-                  libname="${'$'}(basename "${'$'}src")"
-                  rm -rf "${libs}/${'$'}libname"
-                  cp -a "${'$'}src" "${libs}/${'$'}libname"
-                fi
-                printf "%s" "${'$'}digest" > "${'$'}marker"
-                rm -rf "${'$'}tmp"
-              done
-              cd "${sketch}"
-              echo "ESP Forge resource-aware compiler parallelism: ${effectiveJobs} job(s)" > "${out}/build.log"
-              if ! arduino-cli compile --fqbn "${fqbn}" ${boardOption} --libraries "${libs}" --build-path "${'$'}cache/build" --output-dir "${out}/artifacts" --jobs ${effectiveJobs} . >> "${out}/build.log" 2>&1; then cat "${out}/build.log"; exit 1; fi
-              mkdir -p "${out}/package/firmware"
-              find "${out}/artifacts" -maxdepth 1 -type f \( -name "*.bin" -o -name "*.hex" -o -name "*.uf2" \) -exec cp {} "${out}/package/firmware/" \;
-              count=${'$'}(find "${out}/package/firmware" -type f | wc -l)
-              [ "${'$'}count" -gt 0 ] || { echo "No firmware artifacts produced"; exit 2; }
-              printf "%s" "{\"board\":\"${board.id}\",\"fqbn\":\"${fqbn}\"}" > "${out}/package/build-manifest.json"
-              cp "${out}/build.log" "${out}/package/build.log"
-              cd "${out}/package"
-              zip -qr "${out}/firmware.zip" firmware build-manifest.json build.log
-              rm -rf "${out}/package"
-              echo "Build succeeded. Firmware package: ${out}/firmware.zip"
-            '
-        """.trimIndent()
-        val intent = Intent(TERMUX_ACTION).apply {
-            component = ComponentName("com.termux", "com.termux.app.RunCommandService")
-            putExtra("com.termux.RUN_COMMAND_PATH", "${'$'}PREFIX/bin/bash")
-            putExtra("com.termux.RUN_COMMAND_ARGUMENTS", arrayOf("-lc", script))
-            putExtra("com.termux.RUN_COMMAND_BACKGROUND", false)
-            putExtra("com.termux.RUN_COMMAND_WORKDIR", "${'$'}HOME")
-            putExtra("com.termux.RUN_COMMAND_LABEL", "ESP Forge offline compile")
-        }
-        val callback = PendingIntent.getService(
-            activity,
-            (System.currentTimeMillis() and 0x7FFFFFFF).toInt(),
-            Intent(activity, TermuxResultService::class.java),
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_MUTABLE
-        )
-        intent.putExtra("com.termux.RUN_COMMAND_PENDING_INTENT", callback)
-        activity.startService(intent)
-        true
-    }.getOrElse { false }
-}
-
-private fun runTermuxSetup(activity: MainActivity, board: BoardOption): Boolean {
-    return runCatching {
-        val fqbn = board.fqbn
-        val core = board.core
-        val script = """
-            set -e
-            if ! command -v proot-distro >/dev/null 2>&1; then pkg update -y; pkg install -y proot-distro; fi
-            if [ ! -d "${'$'}PREFIX/var/lib/proot-distro/installed-rootfs/debian" ]; then proot-distro install debian; fi
-            proot-distro login debian -- bash -lc 'set -e
-              if ! command -v curl >/dev/null 2>&1 || ! command -v unzip >/dev/null 2>&1 || ! command -v zip >/dev/null 2>&1; then
-                apt-get update
-                apt-get install -y curl ca-certificates unzip zip python3
-              fi
-              arch="${'$'}(dpkg --print-architecture)"
-              if [ "${'$'}arch" = "arm64" ]; then asset="Linux_ARM64"; elif [ "${'$'}arch" = "amd64" ]; then asset="Linux_64bit"; else echo "Unsupported Debian architecture: ${'$'}arch"; exit 2; fi
-              if [ ! -x /usr/local/bin/arduino-cli ]; then
-                curl -fsSL "https://downloads.arduino.cc/arduino-cli/arduino-cli_1.5.1_${'$'}{asset}.tar.gz" -o /tmp/arduino-cli.tar.gz
-                tar -xzf /tmp/arduino-cli.tar.gz -C /usr/local/bin arduino-cli
-              fi
-              mkdir -p /root/.arduino15
-              cat > /root/.arduino15/arduino-cli.yaml <<EOF
-board_manager:
-  additional_urls:
-    - https://espressif.github.io/arduino-esp32/package_esp32_index.json
-    - https://arduino.esp8266.com/stable/package_esp8266com_index.json
-    - https://github.com/stm32duino/BoardManagerFiles/raw/main/package_stmicroelectronics_index.json
-    - https://github.com/openwch/board_manager_files/raw/main/package_ch32v_index.json
-EOF
-              if ! arduino-cli core list --format json | grep -Eq "\"id\"[[:space:]]*:[[:space:]]*\"${core}\""; then
-                arduino-cli core update-index
-                arduino-cli core install "${core}"
-              else
-                echo "Cached board core already installed: ${core}"
-              fi
-              echo "Local toolchain ready for ${fqbn}"
-            '
-        """.trimIndent()
-        val intent = Intent(TERMUX_ACTION).apply {
-            component = ComponentName("com.termux", "com.termux.app.RunCommandService")
-            putExtra("com.termux.RUN_COMMAND_PATH", "${'$'}PREFIX/bin/bash")
-            putExtra("com.termux.RUN_COMMAND_ARGUMENTS", arrayOf("-lc", script))
-            putExtra("com.termux.RUN_COMMAND_BACKGROUND", false)
-            putExtra("com.termux.RUN_COMMAND_WORKDIR", "${'$'}HOME")
-            putExtra("com.termux.RUN_COMMAND_LABEL", "ESP Forge toolchain setup")
-        }
-        activity.startService(intent)
-        true
-    }.getOrElse { false }
 }
 
 private fun queryDisplayName(context: Context, uri: Uri): String {
