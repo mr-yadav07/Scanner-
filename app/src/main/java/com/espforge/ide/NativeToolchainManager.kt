@@ -75,7 +75,7 @@ internal class NativeToolchainManager(context: Context) {
         configureArduinoCli()
         val installed = runGuest(
             listOf("/bin/bash", "-lc",
-                "arduino-cli core list --format json | grep -Fq '\"id\":\"$core\"'"),
+                "arduino-cli core list --format json | grep -Eq '\"id\"[[:space:]]*:[[:space:]]*\"$core\"'"),
             timeoutMs = 60_000
         )
         if (installed.exitCode != 0) {
