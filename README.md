@@ -13,6 +13,7 @@ ESP Forge is an Android-first Arduino / embedded development environment, replac
 - Online server-side Arduino Library Manager index lookup and package installation for recognized `#include` dependencies.
 - USB serial monitor and command sending.
 - Direct ROM/bootloader flashing implemented in the app for ESP8266, ESP32 / ESP32-S3, and ATmega328P Uno/Nano (STK500v1), with verification paths in code.
+- Freshly compiled firmware is loaded directly into the Upload screen, avoiding a manual ZIP re-import before USB flashing.
 
 ## Build the APK
 
