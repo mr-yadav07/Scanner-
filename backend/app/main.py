@@ -30,6 +30,9 @@ DOWNLOAD_DIR = Path(os.getenv("ARDUINO_DIRECTORIES_DOWNLOADS", "/opt/arduino-dow
 CONFIG_FILE = DATA_DIR / "arduino-cli.yaml"
 API_KEY = os.getenv("API_KEY", "")
 CLI_LOCK = threading.Lock()
+BUILD_LOCKS_GUARD = threading.Lock()
+BUILD_LOCKS: dict[str, threading.Lock] = {}
+BUILD_CACHE_DIR = DATA_DIR / "build-cache"
 MAX_PROJECT_BYTES = 350_000
 MAX_FILES = 40
 MAX_BUILD_SECONDS = 900
@@ -81,9 +84,17 @@ app.add_middleware(
 class CompileRequest(BaseModel):
     board: str = Field(min_length=2, max_length=40)
     fqbn: str | None = Field(default=None, max_length=160)
+    project_id: str = Field(default="default", min_length=1, max_length=64)
     files: Dict[str, str]
     libraries: List[str] = Field(default_factory=list, max_length=40)
     optimize: bool = True
+
+    @field_validator("project_id")
+    @classmethod
+    def validate_project_id(cls, value: str) -> str:
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", value):
+            raise ValueError("Project ID may contain only letters, numbers, underscore and hyphen")
+        return value
 
     @field_validator("files")
     @classmethod
@@ -136,6 +147,36 @@ def ensure_cli_config() -> None:
         f"  user: {USER_DIR}\n",
         encoding="utf-8",
     )
+
+
+def project_cache_paths(request: CompileRequest, board: str, fqbn: str):
+    """Return stable sketch/build paths and a per-project lock for incremental builds."""
+    identity = "\\0".join((hashlib.sha256(API_KEY.encode()).hexdigest(), board, fqbn, request.project_id))
+    key = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:32]
+    root = BUILD_CACHE_DIR / key
+    sketch = root / "sketch"
+    build = root / "build"
+    sketch.mkdir(parents=True, exist_ok=True)
+    build.mkdir(parents=True, exist_ok=True)
+    with BUILD_LOCKS_GUARD:
+        lock = BUILD_LOCKS.setdefault(key, threading.Lock())
+    return sketch, build, lock
+
+
+def sync_cached_sketch(sketch: Path, files: Dict[str, str]) -> None:
+    """Keep unchanged files untouched so Arduino's build system can reuse object files."""
+    expected = set()
+    for name, content in files.items():
+        destination = (sketch / name).resolve()
+        if sketch.resolve() not in destination.parents:
+            raise RuntimeError(f"Invalid project path: {name}")
+        expected.add(destination)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if not destination.exists() or destination.read_text(encoding="utf-8") != content:
+            destination.write_text(content, encoding="utf-8")
+    for existing in sketch.rglob("*"):
+        if existing.is_file() and existing.suffix.lower() in {".ino", ".cpp", ".c", ".h", ".hpp"} and existing.resolve() not in expected:
+            existing.unlink()
 
 
 def ensure_core(core: str, log: List[str]) -> None:
@@ -248,25 +289,20 @@ def compile_project(request: CompileRequest, x_api_key: str | None = Header(defa
 
     logs: List[str] = []
     ensure_cli_config()
+    sketch, build_path, build_lock = project_cache_paths(request, board, fqbn)
     work = Path(tempfile.mkdtemp(prefix="espforge-"))
+    build_lock.acquire()
     try:
-        sketch = work / "main"
-        outdir = work / "build"
+        outdir = work / "artifacts"
         libsdir = work / "project-libraries"
-        sketch.mkdir()
         outdir.mkdir()
         libsdir.mkdir()
-        for name, content in request.files.items():
-            dest = (sketch / name).resolve()
-            if sketch.resolve() not in dest.parents:
-                raise HTTPException(status_code=400, detail="Invalid project path.")
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            dest.write_text(content, encoding="utf-8")
+        sync_cached_sketch(sketch, request.files)
         ensure_core(CORE_BY_BOARD[board], logs)
         names = set(request.libraries)
         names.update(auto_library_names(request.files, load_library_index(logs), logs))
         install_libraries(list(names), logs)
-        command = ["compile", "--fqbn", fqbn, "--output-dir", str(outdir), "--warnings", "all"]
+        command = ["compile", "--fqbn", fqbn, "--build-path", str(build_path), "--output-dir", str(outdir), "--jobs", "0", "--warnings", "default"]
         for option in DEFAULT_BOARD_OPTIONS.get(board, []):
             command.extend(["--board-options", option])
         command.append(str(sketch))
@@ -297,6 +333,7 @@ def compile_project(request: CompileRequest, x_api_key: str | None = Header(defa
         raise HTTPException(status_code=422, detail=str(exc))
     finally:
         shutil.rmtree(work, ignore_errors=True)
+        build_lock.release()
 
 
 
@@ -315,6 +352,8 @@ def compile_project_stream(request: CompileRequest, x_api_key: str | None = Head
         raise HTTPException(status_code=400, detail="FQBN does not match the selected board family.")
 
     def stream():
+        sketch, build_path, build_lock = project_cache_paths(request, board, fqbn)
+        build_lock.acquire()
         work = Path(tempfile.mkdtemp(prefix="espforge-stream-"))
         process = None
         started = time.monotonic()
@@ -325,16 +364,9 @@ def compile_project_stream(request: CompileRequest, x_api_key: str | None = Head
         try:
             yield send("progress", stage="Preparing project", progress=3, message="Validating source files and preparing workspace.")
             ensure_cli_config()
-            sketch = work / "main"
-            outdir = work / "build"
-            sketch.mkdir()
+            outdir = work / "artifacts"
             outdir.mkdir()
-            for name, content in request.files.items():
-                dest = (sketch / name).resolve()
-                if sketch.resolve() not in dest.parents:
-                    raise RuntimeError(f"Invalid project path: {name}")
-                dest.parent.mkdir(parents=True, exist_ok=True)
-                dest.write_text(content, encoding="utf-8")
+            sync_cached_sketch(sketch, request.files)
 
             yield send("progress", stage="Board toolchain", progress=10, message=f"Checking/installing {CORE_BY_BOARD[board]}.")
             setup_logs: List[str] = []
@@ -363,7 +395,8 @@ def compile_project_stream(request: CompileRequest, x_api_key: str | None = Head
                 yield send("progress", stage="Libraries ready", progress=48, message="No additional libraries required.")
 
             command = [CLI, "--config-file", str(CONFIG_FILE), "compile", "--fqbn", fqbn,
-                       "--output-dir", str(outdir), "--warnings", "all", "--verbose"]
+                       "--build-path", str(build_path), "--output-dir", str(outdir),
+                       "--jobs", "0", "--warnings", "default"]
             for option in DEFAULT_BOARD_OPTIONS.get(board, []):
                 command.extend(["--board-options", option])
             command.append(str(sketch))
@@ -448,6 +481,7 @@ def compile_project_stream(request: CompileRequest, x_api_key: str | None = Head
                 except Exception:
                     pass
             shutil.rmtree(work, ignore_errors=True)
+            build_lock.release()
 
     return StreamingResponse(
         stream(), media_type="text/event-stream",
