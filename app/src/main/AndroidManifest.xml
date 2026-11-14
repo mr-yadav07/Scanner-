@@ -1,16 +1,12 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <uses-permission android:name="android.permission.INTERNET" />
-    <uses-permission android:name="com.termux.permission.RUN_COMMAND" />
     <uses-feature android:name="android.hardware.usb.host" android:required="false" />
-    <queries>
-        <package android:name="com.termux" />
-    </queries>
     <application
         android:theme="@android:style/Theme.Material.Light.NoActionBar"
         android:label="ESP Forge IDE"
         android:allowBackup="false"
-        android:usesCleartextTraffic="false">
-        <service android:name=".TermuxResultService" android:exported="false" />
+        android:usesCleartextTraffic="false"
+        android:extractNativeLibs="true">
         <activity android:name=".MainActivity" android:exported="true">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
