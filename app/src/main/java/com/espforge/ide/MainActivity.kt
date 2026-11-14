@@ -511,7 +511,8 @@ private fun ForgeHome(activity: MainActivity, themeMode: String, onThemeChange: 
     }
 
     Scaffold(topBar = { TopAppBar(title = { Text("ESP Forge IDE") }, actions = {
-        Text(if (busy) "BUILDING" else "v0.2", style = MaterialTheme.typography.labelMedium, modifier = Modifier.padding(end = 12.dp))
+        TextButton(onClick = { tab = "Settings" }, enabled = !busy) { Text("Settings") }
+        Text(if (busy) "BUILDING" else "v0.3.0", style = MaterialTheme.typography.labelMedium, modifier = Modifier.padding(end = 8.dp))
     }) }) { insets ->
         Column(
             Modifier.padding(insets).fillMaxSize().verticalScroll(rememberScrollState()).padding(14.dp),
@@ -537,7 +538,7 @@ private fun ForgeHome(activity: MainActivity, themeMode: String, onThemeChange: 
                 FilterChip(selected = mode == "Online", onClick = { mode = "Online" }, label = { Text("Online build") })
                 FilterChip(selected = mode == "Offline", onClick = { mode = "Offline" }, label = { Text("Offline build") })
             }
-            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                 listOf("Editor", "Libraries", "Upload", "Serial", "Settings").forEach { item ->
                     FilterChip(selected = tab == item, onClick = { tab = item }, label = { Text(item) })
                 }
@@ -676,7 +677,7 @@ private fun ForgeHome(activity: MainActivity, themeMode: String, onThemeChange: 
                 }
                 "Libraries" -> {
                     Text("Online mode: known #include dependencies are looked up in the Arduino Library Manager index and fetched by the build server. No ZIP upload is needed.")
-                    Text("Offline mode: import ZIP archives once; compile reuses the stored archives after extracting them into the local library directory.")
+                    Text("Local mode: source files and Arduino CLI build objects are cached on-device. Unchanged files are not rewritten, and only changed sources should need recompilation.")
                     OutlinedButton(onClick = { importLibraryLauncher.launch(arrayOf("application/zip", "application/x-zip-compressed", "application/octet-stream")) }, modifier = Modifier.fillMaxWidth()) { Text("Import library ZIP") }
                     if (libraryFiles.isEmpty()) Text("No library ZIPs imported yet.")
                     libraryFiles.forEach { file ->
@@ -790,13 +791,13 @@ private fun ForgeHome(activity: MainActivity, themeMode: String, onThemeChange: 
                     OutlinedTextField(apiKey, { apiKey = it }, label = { Text("Build API key") }, singleLine = true, modifier = Modifier.fillMaxWidth())
                     Button(onClick = { prefs.edit().putString("endpoint", endpoint.trim()).putString("apiKey", apiKey).apply(); output = "Build service settings saved on this device." }, modifier = Modifier.fillMaxWidth()) { Text("Save online settings") }
                     Divider()
-                    Text("Offline prerequisites")
-                    Text("Install Termux (F-Droid/GitHub release), open it once, run termux-setup-storage, set allow-external-apps=true in ~/.termux/termux.properties, then grant ESP Forge the 'Run commands in Termux environment' permission.")
+                    Text("Local compiler prerequisites")
+                    Text("Local compilation currently runs Arduino CLI inside a Termux Debian environment on this phone. Install Termux, open it once, run termux-setup-storage, enable allow-external-apps=true, then grant ESP Forge the Run commands permission. A fully bundled Android-native toolchain is a separate porting task.")
                     Button(onClick = {
                         val ok = if (board.id == "ch32v003") false else runTermuxSetup(activity, board)
                         output = if (ok) "Termux offline toolchain setup launched. Keep Termux open until downloads and core installation finish." else "Termux setup could not start. Check Termux installation and permissions."
                     }, modifier = Modifier.fillMaxWidth()) { Text("Prepare offline toolchain for selected board") }
-                    Text("Offline setup downloads Linux toolchains once; later builds can run without internet when the selected board core and required libraries are already cached.")
+                    Text("First setup downloads the toolchain once. Subsequent builds reuse the installed core, compiler packages, library folder and persistent per-project build cache. Avoid deleting Build/.build-cache if you want incremental builds.")
                 }
             }
             Text("Build log", style = MaterialTheme.typography.titleMedium)
@@ -926,7 +927,7 @@ private fun compileOnline(
     val libs = JSONArray()
     libraryText.split(",").map { it.trim() }.filter { it.isNotBlank() }.forEach { libs.put(it) }
     val files = JSONObject(projectFiles)
-    val body = JSONObject().put("board", board).put("fqbn", fqbn).put("files", files).put("libraries", libs)
+    val body = JSONObject().put("board", board).put("fqbn", fqbn).put("project_id", project).put("files", files).put("libraries", libs)
     val url = URL(endpoint.trimEnd('/') + "/v1/compile/stream")
     val conn = (url.openConnection() as HttpURLConnection).apply {
         requestMethod = "POST"
@@ -991,12 +992,13 @@ private fun runOfflineCompile(activity: MainActivity, board: BoardOption, fqbn: 
         val zipFolder = "$WORKSPACE/LibraryZips"
         val sourceWriter = projectFiles.entries.joinToString("\n") { (name, text) ->
             val encoded = Base64.encodeToString(text.toByteArray(Charsets.UTF_8), Base64.NO_WRAP)
-            "printf '%s' '$encoded' | base64 -d > '$sketch/$name'"
+            "tmp='$sketch/.$name.tmp'; printf '%s' '$encoded' | base64 -d > \"\$tmp\"; if ! cmp -s \"\$tmp\" '$sketch/$name'; then mv \"\$tmp\" '$sketch/$name'; else rm -f \"\$tmp\"; fi"
         }
         val boardOption = when (board.id) { "stm32_bluepill" -> "--board-options pnum=BLUEPILL_F103C8"; "ch32v003" -> "--board-options pnum=CH32V003F4"; else -> "" }
         val script = """
             set -e
-            mkdir -p '$sketch' '$libs' '$out'
+            mkdir -p '$sketch' '$libs' '$out' '$out/.build-cache' '$out/artifacts'
+            rm -f '$out/artifacts/'*
             $sourceWriter
             proot-distro login --bind /storage:/storage debian -- bash -lc 'set -e
               mkdir -p '${libs}' '${out}'
@@ -1012,9 +1014,9 @@ private fun runOfflineCompile(activity: MainActivity, board: BoardOption, fqbn: 
                 rm -rf "${'$'}tmp"
               done
               cd '${sketch}'
-              if ! arduino-cli compile --fqbn '${fqbn}' ${boardOption} --libraries '${libs}' --output-dir '${out}' . > '${out}/build.log' 2>&1; then cat '${out}/build.log'; exit 1; fi
+              if ! arduino-cli compile --fqbn '${fqbn}' ${boardOption} --libraries '${libs}' --build-path '${out}/.build-cache' --output-dir '${out}/artifacts' --jobs 0 . > '${out}/build.log' 2>&1; then cat '${out}/build.log'; exit 1; fi
               mkdir -p '${out}/package/firmware'
-              find '${out}' -maxdepth 1 -type f \( -name '*.bin' -o -name '*.hex' -o -name '*.uf2' \) -exec cp {} '${out}/package/firmware/' \;
+              find '${out}/artifacts' -maxdepth 1 -type f \( -name '*.bin' -o -name '*.hex' -o -name '*.uf2' \) -exec cp {} '${out}/package/firmware/' \;
               count=${'$'}(find '${out}/package/firmware' -type f | wc -l)
               [ "${'$'}count" -gt 0 ] || { echo 'No firmware artifacts produced'; exit 2; }
               printf '{"board":"${board.id}","fqbn":"${fqbn}"}' > '${out}/package/build-manifest.json'
