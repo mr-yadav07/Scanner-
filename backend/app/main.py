@@ -354,7 +354,7 @@ def compile_project_stream(request: CompileRequest, x_api_key: str | None = Head
     def stream():
         sketch, build_path, build_lock = project_cache_paths(request, board, fqbn)
         build_lock.acquire()
-        work = Path(tempfile.mkdtemp(prefix="espforge-stream-"))
+        work = None
         process = None
         started = time.monotonic()
 
@@ -362,6 +362,7 @@ def compile_project_stream(request: CompileRequest, x_api_key: str | None = Head
             return "data: " + json.dumps({"type": kind, **payload}, ensure_ascii=False) + "\n\n"
 
         try:
+            work = Path(tempfile.mkdtemp(prefix="espforge-stream-"))
             yield send("progress", stage="Preparing project", progress=3, message="Validating source files and preparing workspace.")
             ensure_cli_config()
             outdir = work / "artifacts"
@@ -480,7 +481,8 @@ def compile_project_stream(request: CompileRequest, x_api_key: str | None = Head
                     process.wait(timeout=3)
                 except Exception:
                     pass
-            shutil.rmtree(work, ignore_errors=True)
+            if work is not None:
+                shutil.rmtree(work, ignore_errors=True)
             build_lock.release()
 
     return StreamingResponse(
