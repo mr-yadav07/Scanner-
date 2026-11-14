@@ -57,6 +57,13 @@ private const val WORKSPACE = "/storage/emulated/0/Documents/ESPForge"
 private const val LIBRARY_ZIPS = "$WORKSPACE/LibraryZips"
 
 private data class BoardOption(val id: String, val label: String, val fqbn: String, val core: String)
+private data class ArduinoLibraryEntry(
+    val name: String,
+    val version: String,
+    val sentence: String,
+    val author: String,
+    val url: String
+)
 internal data class FlashPermissionResult(val device: UsbDevice, val granted: Boolean)
 private val boards = listOf(
     BoardOption("arduino_uno", "Arduino Uno", "arduino:avr:uno", "arduino:avr"),
@@ -375,6 +382,10 @@ private fun ForgeHome(activity: MainActivity, themeMode: String, onThemeChange: 
     var pendingZip by remember { mutableStateOf<ByteArray?>(null) }
     var pendingExport by remember { mutableStateOf<File?>(null) }
     var libraryFiles by remember { mutableStateOf(listOf<File>()) }
+    var libraryQuery by remember { mutableStateOf("") }
+    var libraryResults by remember { mutableStateOf(emptyList<ArduinoLibraryEntry>()) }
+    var libraryManagerBusy by remember { mutableStateOf(false) }
+    var libraryManagerMessage by remember { mutableStateOf("Search the official Arduino Library Manager index.") }
     var usbDevices by remember { mutableStateOf(emptyList<UsbDevice>()) }
     var selectedUsbId by remember { mutableStateOf<Int?>(null) }
     var firmwareImages by remember { mutableStateOf(emptyList<FirmwareImage>()) }
@@ -695,14 +706,82 @@ private fun ForgeHome(activity: MainActivity, themeMode: String, onThemeChange: 
                     }
                 }
                 "Libraries" -> {
-                    Text("Online mode: known #include dependencies are looked up in the Arduino Library Manager index and fetched by the build server. No ZIP upload is needed.")
-                    Text("Local mode: source files and Arduino CLI build objects are cached on-device. Unchanged files are not rewritten, and only changed sources should need recompilation.")
+                    Text("Arduino Library Manager", style = MaterialTheme.typography.titleMedium)
+                    Text("Search the official Arduino library index. Install downloads a ZIP into ESP Forge's local library store and adds the package to the current build dependencies.")
+                    OutlinedTextField(
+                        libraryQuery,
+                        { libraryQuery = it },
+                        label = { Text("Library name or keyword") },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    Button(
+                        enabled = !libraryManagerBusy && libraryQuery.isNotBlank(),
+                        onClick = {
+                            libraryManagerBusy = true
+                            scope.launch {
+                                val result = runCatching {
+                                    withContext(Dispatchers.IO) { searchArduinoLibraries(context, libraryQuery.trim()) }
+                                }
+                                libraryManagerBusy = false
+                                result.onSuccess {
+                                    libraryResults = it
+                                    libraryManagerMessage = if (it.isEmpty()) "No matching libraries found." else "Found ${it.size} matching libraries."
+                                }.onFailure {
+                                    libraryManagerMessage = "Library search failed: ${it.message}"
+                                }
+                            }
+                        },
+                        modifier = Modifier.fillMaxWidth()
+                    ) { Text(if (libraryManagerBusy) "Searching…" else "Search official library index") }
+                    if (libraryManagerBusy) LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                    Text(libraryManagerMessage, style = MaterialTheme.typography.bodySmall)
+                    libraryResults.forEach { entry ->
+                        Card(modifier = Modifier.fillMaxWidth()) {
+                            Column(Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                                Text(entry.name, style = MaterialTheme.typography.titleSmall)
+                                Text("Version ${entry.version} · ${entry.author}", style = MaterialTheme.typography.bodySmall)
+                                if (entry.sentence.isNotBlank()) Text(entry.sentence, style = MaterialTheme.typography.bodySmall)
+                                Button(
+                                    enabled = !libraryManagerBusy,
+                                    onClick = {
+                                        libraryManagerBusy = true
+                                        scope.launch {
+                                            val result = runCatching {
+                                                withContext(Dispatchers.IO) {
+                                                    val zip = downloadArduinoLibrary(context, entry)
+                                                    copyLibraryFileToSharedFolder(context, zip)
+                                                    zip
+                                                }
+                                            }
+                                            libraryManagerBusy = false
+                                            result.onSuccess { zip ->
+                                                refreshLibraries()
+                                                val deps = (extraLibraries.split(',').map { it.trim() }.filter { it.isNotBlank() } + entry.name).distinct()
+                                                extraLibraries = deps.joinToString(", ")
+                                                libraryManagerMessage = "${entry.name} ${entry.version} installed locally and added to this project's dependencies."
+                                            }.onFailure {
+                                                libraryManagerMessage = "Install failed: ${it.message}"
+                                            }
+                                        }
+                                    }
+                                ) { Text("Install locally + add to project") }
+                            }
+                        }
+                    }
+                    Divider()
+                    Text("Installed library archives · ${libraryFiles.size}", style = MaterialTheme.typography.titleSmall)
                     OutlinedButton(onClick = { importLibraryLauncher.launch(arrayOf("application/zip", "application/x-zip-compressed", "application/octet-stream")) }, modifier = Modifier.fillMaxWidth()) { Text("Import library ZIP") }
-                    if (libraryFiles.isEmpty()) Text("No library ZIPs imported yet.")
+                    if (libraryFiles.isEmpty()) Text("No local library ZIPs installed yet.")
                     libraryFiles.forEach { file ->
                         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
                             Text(file.name, modifier = Modifier.weight(1f))
                             TextButton(onClick = { pendingExport = file; exportLibraryLauncher.launch(file.name) }) { Text("Export") }
+                            TextButton(onClick = {
+                                file.delete()
+                                refreshLibraries()
+                                libraryManagerMessage = "Removed ${file.name} from the local library store."
+                            }) { Text("Remove") }
                         }
                     }
                 }
@@ -1170,4 +1249,136 @@ private fun copyToSharedLibraryFolder(context: Context, source: Uri, name: Strin
     }
     val ready = ContentValues().apply { put(MediaStore.MediaColumns.IS_PENDING, 0) }
     context.contentResolver.update(uri, ready, null, null)
+}
+
+
+
+private fun searchArduinoLibraries(context: Context, query: String): List<ArduinoLibraryEntry> {
+    require(query.length in 2..80) { "Enter at least 2 characters." }
+    val cache = File(context.cacheDir, "arduino-library-index.json")
+    if (!cache.exists() || System.currentTimeMillis() - cache.lastModified() > 12L * 60L * 60L * 1000L) {
+        val connection = URL("https://downloads.arduino.cc/libraries/library_index.json").openConnection() as HttpURLConnection
+        connection.connectTimeout = 15000
+        connection.readTimeout = 45000
+        connection.setRequestProperty("User-Agent", "ESP-Forge-IDE")
+        try {
+            connection.connect()
+            require(connection.responseCode in 200..299) { "Arduino Library Manager returned HTTP ${connection.responseCode}." }
+            val temp = File(cache.parentFile, cache.name + ".tmp")
+            connection.inputStream.use { input ->
+                temp.outputStream().buffered().use { output ->
+                    val buffer = ByteArray(32 * 1024)
+                    var total = 0L
+                    while (true) {
+                        val count = input.read(buffer)
+                        if (count < 0) break
+                        total += count
+                        require(total <= 80L * 1024L * 1024L) { "Library index exceeds the 80 MiB safety limit." }
+                        output.write(buffer, 0, count)
+                    }
+                }
+            }
+            if (!temp.renameTo(cache)) {
+                temp.copyTo(cache, overwrite = true)
+                temp.delete()
+            }
+        } finally {
+            connection.disconnect()
+        }
+    }
+
+    val records = JSONObject(cache.readText(Charsets.UTF_8)).optJSONArray("libraries") ?: JSONArray()
+    val latest = linkedMapOf<String, ArduinoLibraryEntry>()
+    for (i in 0 until records.length()) {
+        val item = records.optJSONObject(i) ?: continue
+        val name = item.optString("name").trim()
+        val version = item.optString("version").trim()
+        val url = item.optString("url").trim()
+        if (name.isBlank() || version.isBlank() || !url.startsWith("https://")) continue
+        val candidate = ArduinoLibraryEntry(
+            name = name,
+            version = version,
+            sentence = item.optString("sentence"),
+            author = item.optString("author"),
+            url = url
+        )
+        val previous = latest[name]
+        if (previous == null || compareArduinoVersions(candidate.version, previous.version) > 0) {
+            latest[name] = candidate
+        }
+    }
+    return latest.values.asSequence()
+        .filter { it.name.contains(query, ignoreCase = true) || it.sentence.contains(query, ignoreCase = true) || it.author.contains(query, ignoreCase = true) }
+        .sortedWith(compareBy<ArduinoLibraryEntry> { !it.name.startsWith(query, ignoreCase = true) }.thenBy { it.name.lowercase() })
+        .take(25)
+        .toList()
+}
+
+private fun compareArduinoVersions(first: String, second: String): Int {
+    val a = Regex("\\d+").findAll(first).mapNotNull { it.value.toIntOrNull() }.toList()
+    val b = Regex("\\d+").findAll(second).mapNotNull { it.value.toIntOrNull() }.toList()
+    for (index in 0 until maxOf(a.size, b.size)) {
+        val left = a.getOrElse(index) { 0 }
+        val right = b.getOrElse(index) { 0 }
+        if (left != right) return left.compareTo(right)
+    }
+    return first.compareTo(second, ignoreCase = true)
+}
+
+private fun downloadArduinoLibrary(context: Context, entry: ArduinoLibraryEntry): File {
+    val safe = (entry.name + "-" + entry.version).replace(Regex("[^A-Za-z0-9_.-]"), "_")
+    val directory = File(context.filesDir, "library-zips").apply { mkdirs() }
+    val target = File(directory, "$safe.zip")
+    if (target.isFile && target.length() > 0L) return target
+    val connection = URL(entry.url).openConnection() as HttpURLConnection
+    connection.connectTimeout = 15000
+    connection.readTimeout = 60000
+    connection.instanceFollowRedirects = true
+    try {
+        connection.connect()
+        require(connection.responseCode in 200..299) { "Library download failed with HTTP ${connection.responseCode}." }
+        val temp = File(directory, "$safe.zip.part")
+        connection.inputStream.use { input ->
+            temp.outputStream().buffered().use { output ->
+                val buffer = ByteArray(32 * 1024)
+                var total = 0L
+                while (true) {
+                    val count = input.read(buffer)
+                    if (count < 0) break
+                    total += count
+                    require(total <= 64L * 1024L * 1024L) { "Library archive exceeds the 64 MiB safety limit." }
+                    output.write(buffer, 0, count)
+                }
+            }
+        }
+        require(temp.length() > 22L) { "Downloaded library archive is empty or invalid." }
+        if (!temp.renameTo(target)) {
+            temp.copyTo(target, overwrite = true)
+            temp.delete()
+        }
+        return target
+    } finally {
+        connection.disconnect()
+    }
+}
+
+private fun copyLibraryFileToSharedFolder(context: Context, file: File) {
+    require(Build.VERSION.SDK_INT >= 29) { "Android 10 or newer is required for local compiler library storage." }
+    val values = ContentValues().apply {
+        put(MediaStore.MediaColumns.DISPLAY_NAME, file.name)
+        put(MediaStore.MediaColumns.MIME_TYPE, "application/zip")
+        put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOCUMENTS + "/ESPForge/LibraryZips/")
+        put(MediaStore.MediaColumns.IS_PENDING, 1)
+    }
+    val uri = context.contentResolver.insert(MediaStore.Files.getContentUri("external"), values)
+        ?: throw IllegalStateException("Could not copy the library to the compiler library folder.")
+    try {
+        context.contentResolver.openOutputStream(uri)?.use { output -> file.inputStream().use { it.copyTo(output) } }
+            ?: throw IllegalStateException("Could not open the compiler library destination.")
+        val complete = ContentValues().apply { put(MediaStore.MediaColumns.IS_PENDING, 0) }
+        context.contentResolver.update(uri, complete, null, null)
+    } catch (error: Exception) {
+        context.contentResolver.delete(uri, null, null)
+        throw error
+    }
 }
