@@ -33,6 +33,9 @@ CLI_LOCK = threading.Lock()
 BUILD_LOCKS_GUARD = threading.Lock()
 BUILD_LOCKS: dict[str, threading.Lock] = {}
 BUILD_CACHE_DIR = DATA_DIR / "build-cache"
+MAX_CONCURRENT_BUILDS = max(1, min(8, int(os.getenv("ESP_FORGE_MAX_CONCURRENT_BUILDS", "2"))))
+BUILD_QUEUE_TIMEOUT_SECONDS = max(1, int(os.getenv("ESP_FORGE_BUILD_QUEUE_TIMEOUT", "300")))
+BUILD_SLOTS = threading.BoundedSemaphore(MAX_CONCURRENT_BUILDS)
 MAX_PROJECT_BYTES = 350_000
 MAX_FILES = 40
 MAX_BUILD_SECONDS = 900
@@ -133,6 +136,53 @@ def run_cli(args: List[str], timeout: int = 300) -> subprocess.CompletedProcess:
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=timeout,
         check=False, env=os.environ.copy()
     )
+
+
+def available_memory_bytes() -> int | None:
+    """Best-effort memory budget detection for container/cgroup and Linux hosts."""
+    for limit_path, current_path in (
+        (Path("/sys/fs/cgroup/memory.max"), Path("/sys/fs/cgroup/memory.current")),
+        (Path("/sys/fs/cgroup/memory/memory.limit_in_bytes"), Path("/sys/fs/cgroup/memory/memory.usage_in_bytes")),
+    ):
+        try:
+            raw_limit = limit_path.read_text(encoding="utf-8").strip()
+            if raw_limit != "max":
+                limit = int(raw_limit)
+                used = int(current_path.read_text(encoding="utf-8").strip()) if current_path.exists() else 0
+                if 0 < limit < (1 << 60):
+                    return max(0, limit - used)
+        except (OSError, ValueError):
+            pass
+    try:
+        for line in Path("/proc/meminfo").read_text(encoding="utf-8").splitlines():
+            if line.startswith("MemAvailable:"):
+                return int(line.split()[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    try:
+        return int(os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_AVPHYS_PAGES"))
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def resolve_compile_jobs(
+    requested: int,
+    board: str,
+    cpu_count: int | None = None,
+    memory_bytes: int | None = None,
+) -> int:
+    """Cap compiler parallelism by CPU and a conservative per-board RAM budget."""
+    cpus = max(1, cpu_count or os.cpu_count() or 1)
+    memory = available_memory_bytes() if memory_bytes is None else memory_bytes
+    per_job_mib = 1800 if board in {"esp32", "esp32_s3"} else 1300 if board == "esp8266" else 900
+    if memory is None:
+        memory_jobs = max(1, min(2, cpus))
+    else:
+        # Leave 384 MiB for the OS, API process, downloads and packaging.
+        usable_mib = max(512, (memory // (1024 * 1024)) - 384)
+        memory_jobs = max(1, usable_mib // per_job_mib)
+    safe_limit = max(1, min(16, cpus, memory_jobs))
+    return min(requested, safe_limit) if requested > 0 else safe_limit
 
 
 def ensure_cli_config() -> None:
@@ -314,7 +364,12 @@ def compile_project(request: CompileRequest, x_api_key: str | None = Header(defa
     sketch, build_path, build_lock = project_cache_paths(request, board, fqbn)
     work = Path(tempfile.mkdtemp(prefix="espforge-"))
     build_lock.acquire()
+    slot_acquired = False
     try:
+        slot_acquired = BUILD_SLOTS.acquire(timeout=BUILD_QUEUE_TIMEOUT_SECONDS)
+        if not slot_acquired:
+            raise HTTPException(status_code=503, detail="Build queue is full. Retry after an active build finishes.")
+        compile_jobs = resolve_compile_jobs(request.jobs, board)
         outdir = work / "artifacts"
         libsdir = work / "project-libraries"
         outdir.mkdir()
@@ -324,7 +379,7 @@ def compile_project(request: CompileRequest, x_api_key: str | None = Header(defa
         names = set(request.libraries)
         names.update(auto_library_names(request.files, load_library_index(logs), logs))
         install_libraries(list(names), logs)
-        command = ["compile", "--fqbn", fqbn, "--build-path", str(build_path), "--output-dir", str(outdir), "--jobs", str(request.jobs), "--warnings", "default"]
+        command = ["compile", "--fqbn", fqbn, "--build-path", str(build_path), "--output-dir", str(outdir), "--jobs", str(compile_jobs), "--warnings", "default"]
         for option in DEFAULT_BOARD_OPTIONS.get(board, []):
             command.extend(["--board-options", option])
         command.append(str(sketch))
@@ -355,6 +410,8 @@ def compile_project(request: CompileRequest, x_api_key: str | None = Header(defa
         raise HTTPException(status_code=422, detail=str(exc))
     finally:
         shutil.rmtree(work, ignore_errors=True)
+        if slot_acquired:
+            BUILD_SLOTS.release()
         build_lock.release()
 
 
@@ -376,6 +433,7 @@ def compile_project_stream(request: CompileRequest, x_api_key: str | None = Head
     def stream():
         sketch, build_path, build_lock = project_cache_paths(request, board, fqbn)
         build_lock.acquire()
+        slot_acquired = False
         work = None
         process = None
         started = time.monotonic()
@@ -384,6 +442,12 @@ def compile_project_stream(request: CompileRequest, x_api_key: str | None = Head
             return "data: " + json.dumps({"type": kind, **payload}, ensure_ascii=False) + "\n\n"
 
         try:
+            yield send("progress", stage="Build queue", progress=1, message=f"Waiting for a build slot (maximum {MAX_CONCURRENT_BUILDS} concurrent builds).")
+            slot_acquired = BUILD_SLOTS.acquire(timeout=BUILD_QUEUE_TIMEOUT_SECONDS)
+            if not slot_acquired:
+                raise TimeoutError("Build queue is full. Retry after an active build finishes.")
+            compile_jobs = resolve_compile_jobs(request.jobs, board)
+            yield send("progress", stage="Build slot acquired", progress=2, message=f"Resource-aware compiler parallelism: {compile_jobs} job(s).")
             work = Path(tempfile.mkdtemp(prefix="espforge-stream-"))
             yield send("progress", stage="Preparing project", progress=3, message="Validating source files and preparing workspace.")
             ensure_cli_config()
@@ -419,7 +483,7 @@ def compile_project_stream(request: CompileRequest, x_api_key: str | None = Head
 
             command = [CLI, "--config-file", str(CONFIG_FILE), "compile", "--fqbn", fqbn,
                        "--build-path", str(build_path), "--output-dir", str(outdir),
-                       "--jobs", str(request.jobs), "--warnings", "default"]
+                       "--jobs", str(compile_jobs), "--warnings", "default"]
             for option in DEFAULT_BOARD_OPTIONS.get(board, []):
                 command.extend(["--board-options", option])
             command.append(str(sketch))
@@ -505,6 +569,8 @@ def compile_project_stream(request: CompileRequest, x_api_key: str | None = Head
                     pass
             if work is not None:
                 shutil.rmtree(work, ignore_errors=True)
+            if slot_acquired:
+                BUILD_SLOTS.release()
             build_lock.release()
 
     return StreamingResponse(

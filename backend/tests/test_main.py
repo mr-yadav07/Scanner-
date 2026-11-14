@@ -100,3 +100,22 @@ def test_parallel_jobs_setting_is_bounded():
         assert False
     except ValueError:
         pass
+
+
+def test_resource_aware_parallelism_respects_cpu_and_memory():
+    from app.main import resolve_compile_jobs
+
+    # 2 GiB available: ESP32 gets one compiler process after OS headroom.
+    assert resolve_compile_jobs(0, "esp32", cpu_count=8, memory_bytes=2 * 1024**3) == 1
+    # A smaller board can use more workers under the same memory budget.
+    assert resolve_compile_jobs(0, "arduino_uno", cpu_count=8, memory_bytes=4 * 1024**3) == 4
+    # Explicit user settings are respected only up to the safe resource ceiling.
+    assert resolve_compile_jobs(8, "arduino_uno", cpu_count=2, memory_bytes=8 * 1024**3) == 2
+    assert resolve_compile_jobs(0, "esp32", cpu_count=1, memory_bytes=16 * 1024**3) == 1
+
+
+def test_build_queue_is_globally_bounded():
+    from app.main import BUILD_SLOTS, MAX_CONCURRENT_BUILDS
+
+    assert MAX_CONCURRENT_BUILDS >= 1
+    assert isinstance(BUILD_SLOTS, __import__("threading").BoundedSemaphore)
