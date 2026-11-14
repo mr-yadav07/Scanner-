@@ -1206,16 +1206,16 @@ private fun resolveLocalCompileJobs(activity: MainActivity, boardId: String, req
     val memoryInfo = ActivityManager.MemoryInfo()
     activityManager.getMemoryInfo(memoryInfo)
     val availableMiB = (memoryInfo.availMem / (1024L * 1024L)).toInt().coerceAtLeast(512)
-    val reserveMiB = 512
+    val reserveMiB = 768
     val memoryPerCompilerMiB = when (boardId) {
-        "esp32", "esp32_s3" -> 1400
-        "esp8266" -> 950
-        "arduino_uno", "arduino_nano" -> 400
-        else -> 850
+        "esp32", "esp32_s3" -> 1200
+        "esp8266" -> 800
+        "arduino_uno", "arduino_nano" -> 320
+        else -> 700
     }
     val memorySlots = ((availableMiB - reserveMiB) / memoryPerCompilerMiB).coerceAtLeast(1)
-    // Keep sustained phone thermals and UI responsiveness predictable under large builds.
-    val safeMaximum = minOf(cpuCount, memorySlots, 4).coerceAtLeast(1)
+    // Memory-aware parallelism: allow up to six workers, but reserve RAM for Android and the IDE.
+    val safeMaximum = minOf(cpuCount, memorySlots, 6).coerceAtLeast(1)
     return if (requested <= 0) safeMaximum else requested.coerceIn(1, safeMaximum)
 }
 
