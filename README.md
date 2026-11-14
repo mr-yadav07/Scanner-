@@ -40,7 +40,7 @@ A hosted service needs sufficient memory and storage for the selected board pack
 
 ## Local compilation setup
 
-Local compilation runs from inside ESP Forge. On first use, the app downloads a signed-by-hash Debian ARM64 runtime from the project's GitHub Release, installs the official Arduino CLI and the selected vendor board core, then keeps toolchains and per-project build caches in app-private storage. Later builds reuse unchanged source files, downloaded cores, libraries and compiler objects. The compiler worker setting is an upper limit; available Android RAM and CPU count cap the actual parallelism.
+Local compilation runs from inside ESP Forge. On first use, the app downloads a Debian ARM64 runtime and verifies its SHA-256 checksum from the project's GitHub Release, installs the official Arduino CLI and the selected vendor board core, then keeps toolchains and per-project build caches in app-private storage. Later builds reuse unchanged source files, downloaded cores, libraries and compiler objects. The compiler worker setting is an upper limit; available Android RAM and CPU count cap the actual parallelism.
 
 The app-managed local compiler targets ARM64 phones and currently supports Arduino Uno/Nano, ESP8266, ESP32/ESP32-S3 and STM32 Blue Pill F103C8, subject to the current vendor index publishing ARM64 Linux tools. WCH CH32V003 remains Remote Arduino CLI only because its published compiler package does not currently offer an ARM64 Linux host build. Online compilation remains available for all configured board presets.
 
