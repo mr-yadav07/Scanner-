@@ -640,7 +640,7 @@ private fun ForgeHome(activity: MainActivity, themeMode: String, onThemeChange: 
                             buildProgress = 2
                             buildStartedAt = android.os.SystemClock.elapsedRealtime()
                             buildLog = "Starting the compiler runtime inside ESP Forge…"
-                            output = "Preparing the local ARM64 compiler. Termux is not required."
+                            output = "Preparing the local ARM64 compiler."
                             scope.launch {
                                 try {
                                     val compiled = withContext(Dispatchers.IO) {
