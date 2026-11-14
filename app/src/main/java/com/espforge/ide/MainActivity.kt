@@ -1166,7 +1166,7 @@ private fun runOfflineCompile(activity: MainActivity, board: BoardOption, fqbn: 
               done
               cd "${sketch}"
               echo "ESP Forge resource-aware compiler parallelism: ${effectiveJobs} job(s)" > "${out}/build.log"
-              if ! arduino-cli compile --fqbn "${fqbn}" ${boardOption} --libraries "${libs}" --build-path "${'
+              if ! arduino-cli compile --fqbn "${fqbn}" ${boardOption} --libraries "${libs}" --build-path "${'$'}cache/build" --output-dir "${out}/artifacts" --jobs ${effectiveJobs} . >> "${out}/build.log" 2>&1; then cat "${out}/build.log"; exit 1; fi
               mkdir -p "${out}/package/firmware"
               find "${out}/artifacts" -maxdepth 1 -type f \( -name "*.bin" -o -name "*.hex" -o -name "*.uf2" \) -exec cp {} "${out}/package/firmware/" \;
               count=${'$'}(find "${out}/package/firmware" -type f | wc -l)
