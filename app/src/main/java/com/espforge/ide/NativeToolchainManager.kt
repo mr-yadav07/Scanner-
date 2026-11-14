@@ -63,14 +63,24 @@ internal class NativeToolchainManager(context: Context) {
             runChecked(
                 listOf("/bin/bash", "-lc",
                     "set -e; export DEBIAN_FRONTEND=noninteractive; apt-get update; " +
-                    "apt-get install -y ca-certificates curl python3 unzip zip xz-utils; " +
-                    "curl --retry 3 --retry-all-errors -fsSL " +
-                    "https://downloads.arduino.cc/arduino-cli/arduino-cli_1.6.0_Linux_ARM64.tar.gz " +
-                    "-o /tmp/arduino-cli.tar.gz; " +
-                    "tar -xzf /tmp/arduino-cli.tar.gz -C /usr/local/bin arduino-cli; " +
-                    "chmod 755 /usr/local/bin/arduino-cli; rm -f /tmp/arduino-cli.tar.gz"
+                    "apt-get install -y ca-certificates curl python3 unzip zip xz-utils"
                 ), 30 * 60_000L, onLine
             )
+            // Download with Android's network stack. PRoot guest DNS can fail on
+            // mobile networks even while Android itself has working connectivity.
+            val cliArchive = File(workspace, "Downloads/arduino-cli.tar.gz")
+            downloadWithRetry(
+                "https://downloads.arduino.cc/arduino-cli/arduino-cli_1.6.0_Linux_ARM64.tar.gz",
+                cliArchive,
+                onLine
+            )
+            runChecked(
+                listOf("/bin/bash", "-lc",
+                    "set -e; tar -xzf /workspace/Downloads/arduino-cli.tar.gz " +
+                    "-C /usr/local/bin arduino-cli; chmod 755 /usr/local/bin/arduino-cli"
+                ), 5 * 60_000L, onLine
+            )
+            cliArchive.delete()
         }
         configureArduinoCli()
         val installed = runGuest(
@@ -353,6 +363,61 @@ internal class NativeToolchainManager(context: Context) {
         if (!config.isFile || config.readText(Charsets.UTF_8) != contents) {
             config.writeText(contents, Charsets.UTF_8)
         }
+    }
+
+    private fun downloadWithRetry(url: String, destination: File, onLine: (String) -> Unit) {
+        destination.parentFile?.mkdirs()
+        val partial = File(destination.parentFile, destination.name + ".part")
+        var lastError: Exception? = null
+        for (attempt in 1..5) {
+            var connection: HttpURLConnection? = null
+            try {
+                onLine("Downloading Arduino CLI via Android network (attempt $attempt/5)…")
+                partial.delete()
+                connection = (URL(url).openConnection() as HttpURLConnection).apply {
+                    connectTimeout = 25_000
+                    readTimeout = 90_000
+                    instanceFollowRedirects = true
+                    requestMethod = "GET"
+                    setRequestProperty("User-Agent", "ESPForge-IDE/0.5")
+                }
+                connection.connect()
+                val status = connection.responseCode
+                if (status !in 200..299) throw java.io.IOException("Arduino CLI server returned HTTP $status")
+                connection.inputStream.use { input ->
+                    FileOutputStream(partial).use { output ->
+                        val buffer = ByteArray(64 * 1024)
+                        while (true) {
+                            val count = input.read(buffer)
+                            if (count < 0) break
+                            output.write(buffer, 0, count)
+                        }
+                        output.fd.sync()
+                    }
+                }
+                if (partial.length() < 1_000_000L) {
+                    throw java.io.IOException("Arduino CLI archive is unexpectedly small (" + partial.length() + " bytes)")
+                }
+                if (destination.exists()) destination.delete()
+                check(partial.renameTo(destination)) { "Unable to finalize Arduino CLI download." }
+                onLine("Arduino CLI archive downloaded (" + destination.length() + " bytes).")
+                return
+            } catch (e: Exception) {
+                lastError = e
+                partial.delete()
+                if (attempt < 5) {
+                    val delay = 1_500L * attempt
+                    onLine("Arduino CLI download failed: " + e.message + ". Retrying in " + (delay / 1000) + "s…")
+                    Thread.sleep(delay)
+                }
+            } finally {
+                connection?.disconnect()
+            }
+        }
+        throw IllegalStateException(
+            "Unable to download Arduino CLI after 5 attempts. Check mobile data/Wi-Fi, Private DNS, " +
+                "or try another network. Details: " + (lastError?.message ?: "unknown network error")
+        )
     }
 
     private fun installLocalLibraries(zips: List<File>, libraryDirectory: File, onLine: (String) -> Unit) {
