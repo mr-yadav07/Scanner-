@@ -85,6 +85,7 @@ class CompileRequest(BaseModel):
     board: str = Field(min_length=2, max_length=40)
     fqbn: str | None = Field(default=None, max_length=160)
     project_id: str = Field(default="default", min_length=1, max_length=64)
+    jobs: int = Field(default=0, ge=0, le=16)
     files: Dict[str, str]
     libraries: List[str] = Field(default_factory=list, max_length=40)
     optimize: bool = True
@@ -302,7 +303,7 @@ def compile_project(request: CompileRequest, x_api_key: str | None = Header(defa
         names = set(request.libraries)
         names.update(auto_library_names(request.files, load_library_index(logs), logs))
         install_libraries(list(names), logs)
-        command = ["compile", "--fqbn", fqbn, "--build-path", str(build_path), "--output-dir", str(outdir), "--jobs", "0", "--warnings", "default"]
+        command = ["compile", "--fqbn", fqbn, "--build-path", str(build_path), "--output-dir", str(outdir), "--jobs", str(request.jobs), "--warnings", "default"]
         for option in DEFAULT_BOARD_OPTIONS.get(board, []):
             command.extend(["--board-options", option])
         command.append(str(sketch))
