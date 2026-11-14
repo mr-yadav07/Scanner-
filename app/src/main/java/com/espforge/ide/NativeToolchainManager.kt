@@ -606,19 +606,21 @@ private class AndroidHttpProxy : java.io.Closeable {
                 val authority = parts[1]
                 val host = authority.substringBeforeLast(':')
                 val remotePort = authority.substringAfterLast(':', "443").toIntOrNull() ?: 443
-                upstream = java.net.Socket()
-                upstream.connect(java.net.InetSocketAddress(host, remotePort), 30_000)
-                upstream.soTimeout = 120_000
+                val remote = java.net.Socket()
+                upstream = remote
+                remote.connect(java.net.InetSocketAddress(host, remotePort), 30_000)
+                remote.soTimeout = 120_000
                 client.getOutputStream().write("HTTP/1.1 200 Connection Established\r\n\r\n".toByteArray(Charsets.US_ASCII))
                 client.getOutputStream().flush()
-                tunnel(client, upstream)
+                tunnel(client, remote)
             } else {
                 val uri = java.net.URI(parts[1])
                 val host = uri.host ?: throw java.io.IOException("URL has no host")
                 val remotePort = if (uri.port > 0) uri.port else if (uri.scheme == "https") 443 else 80
-                upstream = java.net.Socket()
-                upstream.connect(java.net.InetSocketAddress(host, remotePort), 30_000)
-                upstream.soTimeout = 120_000
+                val remote = java.net.Socket()
+                upstream = remote
+                remote.connect(java.net.InetSocketAddress(host, remotePort), 30_000)
+                remote.soTimeout = 120_000
                 val path = (uri.rawPath?.takeIf { it.isNotEmpty() } ?: "/") + (uri.rawQuery?.let { "?$it" } ?: "")
                 val rewritten = buildString {
                     append(parts[0]).append(' ').append(path).append(' ').append(parts[2]).append("\r\n")
@@ -629,7 +631,6 @@ private class AndroidHttpProxy : java.io.Closeable {
                 }
                 upstream.getOutputStream().write(rewritten.toByteArray(Charsets.ISO_8859_1))
                 upstream.getOutputStream().flush()
-                val remote = upstream
                 val writer = Thread {
                     runCatching { input.copyTo(remote.getOutputStream()); remote.shutdownOutput() }
                 }.apply { isDaemon = true; start() }
