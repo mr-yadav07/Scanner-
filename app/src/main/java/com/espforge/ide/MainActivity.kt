@@ -1025,12 +1025,23 @@ private fun runOfflineCompile(activity: MainActivity, board: BoardOption, fqbn: 
             val encoded = Base64.encodeToString(text.toByteArray(Charsets.UTF_8), Base64.NO_WRAP)
             "tmp='$sketch/.$name.tmp'; printf '%s' '$encoded' | base64 -d > \"\$tmp\"; if ! cmp -s \"\$tmp\" '$sketch/$name'; then mv \"\$tmp\" '$sketch/$name'; else rm -f \"\$tmp\"; fi"
         }
+        val expectedSourceFiles = projectFiles.keys.joinToString(" ")
+        val sourceCleanup = """
+            for f in '$sketch'/*.ino '$sketch'/*.cpp '$sketch'/*.c '$sketch'/*.h '$sketch'/*.hpp; do
+              [ -f "${'$'}f" ] || continue
+              case " $expectedSourceFiles " in
+                *" ${'$'}(basename "${'$'}f") "*) ;;
+                *) rm -f "${'$'}f" ;;
+              esac
+            done
+        """.trimIndent()
         val boardOption = when (board.id) { "stm32_bluepill" -> "--board-options pnum=BLUEPILL_F103C8"; "ch32v003" -> "--board-options pnum=CH32V003F4"; else -> "" }
         val script = """
             set -e
             mkdir -p '$sketch' '$libs' '$out' '$out/artifacts'
             rm -f '$out/artifacts/'*
             $sourceWriter
+            $sourceCleanup
             proot-distro login --bind /storage:/storage debian -- bash -lc 'set -e
               cache="${'$'}HOME/.cache/espforge/${project}/${fqbn.replace(':', '_')}"
               mkdir -p "${'$'}cache/build" "${libs}" "${out}"
