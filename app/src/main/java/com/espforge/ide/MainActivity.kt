@@ -513,7 +513,7 @@ private fun ForgeHome(activity: MainActivity, themeMode: String, onThemeChange: 
 
     Scaffold(topBar = { TopAppBar(title = { Text("ESP Forge IDE") }, actions = {
         TextButton(onClick = { tab = "Settings" }, enabled = !busy) { Text("Settings") }
-        Text(if (busy) "BUILDING" else "v0.3.0", style = MaterialTheme.typography.labelMedium, modifier = Modifier.padding(end = 8.dp))
+        Text(if (busy) "BUILDING" else "v0.4.0", style = MaterialTheme.typography.labelMedium, modifier = Modifier.padding(end = 8.dp))
     }) }) { insets ->
         Column(
             Modifier.padding(insets).fillMaxSize().verticalScroll(rememberScrollState()).padding(14.dp),
