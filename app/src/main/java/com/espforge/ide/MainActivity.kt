@@ -360,7 +360,7 @@ private fun ForgeHome(activity: MainActivity, themeMode: String, onThemeChange: 
     var apiKey by remember { mutableStateOf(prefs.getString("apiKey", "") ?: "") }
     var compileJobs by remember { mutableStateOf(prefs.getInt("compileJobs", 0)) }
     var extraLibraries by remember { mutableStateOf("") }
-    var output by remember { mutableStateOf("Ready. Configure the online build API or prepare the offline Termux toolchain.") }
+    var output by remember { mutableStateOf("Select a board, prepare the local toolchain once, then compile locally or use the remote Arduino CLI service.") }
     var tab by remember { mutableStateOf("Editor") }
     var busy by remember { mutableStateOf(false) }
     var buildProgress by remember { mutableStateOf(0) }
@@ -536,7 +536,7 @@ private fun ForgeHome(activity: MainActivity, themeMode: String, onThemeChange: 
             }
             OutlinedTextField(fqbn, { fqbn = it }, label = { Text("Board FQBN (advanced)") }, singleLine = true, modifier = Modifier.fillMaxWidth())
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                FilterChip(selected = mode == "Online", onClick = { mode = "Online"; prefs.edit().putString("buildMode", mode).apply() }, label = { Text("Arduino CLI cloud") })
+                FilterChip(selected = mode == "Online", onClick = { mode = "Online"; prefs.edit().putString("buildMode", mode).apply() }, label = { Text("Remote Arduino CLI") })
                 FilterChip(selected = mode == "Offline", onClick = { mode = "Offline"; prefs.edit().putString("buildMode", mode).apply() }, label = { Text("Local build") })
             }
             Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
@@ -787,7 +787,7 @@ private fun ForgeHome(activity: MainActivity, themeMode: String, onThemeChange: 
                     }
                     Text("Theme selection is saved on this device.", style = MaterialTheme.typography.bodySmall)
                     Divider()
-                    Text("Arduino CLI cloud build service")
+                    Text("Remote Arduino CLI build service")
                     OutlinedTextField(endpoint, { endpoint = it }, label = { Text("Build API base URL (e.g. https://your-host)") }, singleLine = true, modifier = Modifier.fillMaxWidth())
                     OutlinedTextField(apiKey, { apiKey = it }, label = { Text("Build API key") }, singleLine = true, modifier = Modifier.fillMaxWidth())
                     Button(onClick = { prefs.edit().putString("endpoint", endpoint.trim()).putString("apiKey", apiKey).apply(); output = "Build service settings saved on this device." }, modifier = Modifier.fillMaxWidth()) { Text("Save online settings") }
