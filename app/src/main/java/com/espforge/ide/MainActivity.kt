@@ -493,14 +493,80 @@ private fun ForgeHome(activity: MainActivity, themeMode: String, onThemeChange: 
         }
     }
 
-    Scaffold(topBar = { TopAppBar(title = { Text("ESP Forge IDE") }, actions = {
-        TextButton(onClick = { tab = "Settings" }, enabled = !busy) { Text("Settings") }
-        Text(if (busy) "BUILDING" else "v0.5.0", style = MaterialTheme.typography.labelMedium, modifier = Modifier.padding(end = 8.dp))
-    }) }) { insets ->
+    Scaffold(
+        topBar = {
+            TopAppBar(
+                title = {
+                    Column(verticalArrangement = Arrangement.spacedBy(1.dp)) {
+                        Text("ESP Forge", style = MaterialTheme.typography.titleLarge)
+                        Text(if (busy) buildStage else "IDE · v0.6.0", style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                },
+                actions = {
+                    Surface(
+                        shape = MaterialTheme.shapes.large,
+                        color = if (busy) MaterialTheme.colorScheme.tertiaryContainer else MaterialTheme.colorScheme.secondaryContainer,
+                        tonalElevation = 3.dp,
+                        modifier = Modifier.padding(end = 10.dp)
+                    ) {
+                        Text(if (busy) "BUILDING" else "READY", modifier = Modifier.padding(horizontal = 12.dp, vertical = 7.dp),
+                            style = MaterialTheme.typography.labelSmall)
+                    }
+                }
+            )
+        },
+        bottomBar = {
+            NavigationBar(tonalElevation = 8.dp) {
+                listOf("Editor", "Libraries", "Upload", "Serial", "Settings").forEach { item ->
+                    val symbol = when (item) {
+                        "Editor" -> "⌘"
+                        "Libraries" -> "▦"
+                        "Upload" -> "⇧"
+                        "Serial" -> "⌁"
+                        else -> "⚙"
+                    }
+                    NavigationBarItem(
+                        selected = tab == item,
+                        onClick = { if (!busy || item == "Editor") tab = item },
+                        icon = { Text(symbol, style = MaterialTheme.typography.titleMedium) },
+                        label = { Text(item, style = MaterialTheme.typography.labelSmall) },
+                        alwaysShowLabel = true
+                    )
+                }
+            }
+        }
+    ) { insets ->
         Column(
-            Modifier.padding(insets).fillMaxSize().verticalScroll(rememberScrollState()).padding(14.dp),
-            verticalArrangement = Arrangement.spacedBy(10.dp)
+            Modifier.padding(insets).fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 16.dp, vertical = 12.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
+            ElevatedCard(
+                modifier = Modifier.fillMaxWidth(),
+                elevation = CardDefaults.elevatedCardElevation(defaultElevation = 5.dp),
+                shape = MaterialTheme.shapes.extraLarge
+            ) {
+                Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                        Text("WORKSPACE", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.primary)
+                        Text(if (mode == "Offline") "LOCAL ENGINE" else "REMOTE ENGINE",
+                            style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                    Text(project, style = MaterialTheme.typography.titleLarge)
+                    Text(board.label + "  ·  " + fqbn, style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    if (busy) {
+                        LinearProgressIndicator(progress = { (buildProgress / 100f).coerceIn(0f, 1f) }, modifier = Modifier.fillMaxWidth())
+                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                            Text(buildStage, style = MaterialTheme.typography.labelMedium)
+                            Text("${buildElapsed}s", style = MaterialTheme.typography.labelMedium)
+                        }
+                    } else {
+                        Text("Ready to prototype", style = MaterialTheme.typography.labelMedium,
+                            color = MaterialTheme.colorScheme.secondary)
+                    }
+                }
+            }
             OutlinedTextField(project, { project = it.filter { c -> c.isLetterOrDigit() || c == '_' || c == '-' }.take(32) },
                 label = { Text("Project") }, singleLine = true, modifier = Modifier.fillMaxWidth())
             var expanded by remember { mutableStateOf(false) }
@@ -520,11 +586,6 @@ private fun ForgeHome(activity: MainActivity, themeMode: String, onThemeChange: 
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 FilterChip(selected = mode == "Online", onClick = { mode = "Online"; prefs.edit().putString("buildMode", mode).apply() }, label = { Text("Remote Arduino CLI") })
                 FilterChip(selected = mode == "Offline", onClick = { mode = "Offline"; prefs.edit().putString("buildMode", mode).apply() }, label = { Text("Local build") })
-            }
-            Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                listOf("Editor", "Libraries", "Upload", "Serial", "Settings").forEach { item ->
-                    FilterChip(selected = tab == item, onClick = { tab = item }, label = { Text(item) })
-                }
             }
             when (tab) {
                 "Editor" -> {
