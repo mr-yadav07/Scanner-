@@ -1,6 +1,7 @@
 package com.espforge.ide
 
 import android.app.PendingIntent
+import android.app.ActivityManager
 import android.content.*
 import android.hardware.usb.UsbManager
 import android.hardware.usb.UsbDevice
@@ -897,7 +898,7 @@ private fun ForgeHome(activity: MainActivity, themeMode: String, onThemeChange: 
                         valueRange = 0f..8f,
                         steps = 7
                     )
-                    Text("Auto maximizes compile throughput. Set 2–4 if Android starts heating or memory becomes tight.", style = MaterialTheme.typography.bodySmall)
+                    Text("Local builds automatically cap compiler workers by available RAM and CPU, with a maximum of 4 simultaneous compiler processes to reduce overheating and out-of-memory failures. Your selected job count is treated as an upper limit.", style = MaterialTheme.typography.bodySmall)
                     Text("Local compilation currently runs Arduino CLI inside a Termux Debian environment on this phone. Install Termux, open it once, run termux-setup-storage, enable allow-external-apps=true, then grant ESP Forge the Run commands permission. A fully bundled Android-native toolchain is a separate porting task.")
                     Button(onClick = {
                         val ok = if (board.id == "ch32v003") false else runTermuxSetup(activity, board)
@@ -1091,6 +1092,25 @@ private fun compileOnline(
     }
 }
 
+private fun resolveLocalCompileJobs(activity: MainActivity, boardId: String, requested: Int): Int {
+    val cpuCount = Runtime.getRuntime().availableProcessors().coerceAtLeast(1)
+    val activityManager = activity.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
+    val memoryInfo = ActivityManager.MemoryInfo()
+    activityManager.getMemoryInfo(memoryInfo)
+    val availableMiB = (memoryInfo.availMem / (1024L * 1024L)).toInt().coerceAtLeast(512)
+    val reserveMiB = 512
+    val memoryPerCompilerMiB = when (boardId) {
+        "esp32", "esp32_s3" -> 1400
+        "esp8266" -> 950
+        "arduino_uno", "arduino_nano" -> 400
+        else -> 850
+    }
+    val memorySlots = ((availableMiB - reserveMiB) / memoryPerCompilerMiB).coerceAtLeast(1)
+    // Keep sustained phone thermals and UI responsiveness predictable under large builds.
+    val safeMaximum = minOf(cpuCount, memorySlots, 4).coerceAtLeast(1)
+    return if (requested <= 0) safeMaximum else requested.coerceIn(1, safeMaximum)
+}
+
 private fun runOfflineCompile(activity: MainActivity, board: BoardOption, fqbn: String, project: String, projectFiles: Map<String, String>, jobs: Int): Boolean {
     return runCatching {
         require(fqbn.matches(Regex("[A-Za-z0-9_.:-]+"))) { "Invalid FQBN" }
@@ -1100,6 +1120,7 @@ private fun runOfflineCompile(activity: MainActivity, board: BoardOption, fqbn: 
         val libs = "$WORKSPACE/InstalledLibraries"
         val out = "$WORKSPACE/Builds/$project"
         val zipFolder = "$WORKSPACE/LibraryZips"
+        val effectiveJobs = resolveLocalCompileJobs(activity, board.id, jobs)
         val sourceWriter = projectFiles.entries.joinToString("\n") { (name, text) ->
             val encoded = Base64.encodeToString(text.toByteArray(Charsets.UTF_8), Base64.NO_WRAP)
             "tmp='$sketch/.$name.tmp'; printf '%s' '$encoded' | base64 -d > \"\$tmp\"; if ! cmp -s \"\$tmp\" '$sketch/$name'; then mv \"\$tmp\" '$sketch/$name'; else rm -f \"\$tmp\"; fi"
@@ -1144,7 +1165,246 @@ private fun runOfflineCompile(activity: MainActivity, board: BoardOption, fqbn: 
                 rm -rf "${'$'}tmp"
               done
               cd "${sketch}"
-              if ! arduino-cli compile --fqbn "${fqbn}" ${boardOption} --libraries "${libs}" --build-path "${'$'}cache/build" --output-dir "${out}/artifacts" --jobs ${jobs} . > "${out}/build.log" 2>&1; then cat "${out}/build.log"; exit 1; fi
+              echo "ESP Forge resource-aware compiler parallelism: ${effectiveJobs} job(s)" > "${out}/build.log"
+              if ! arduino-cli compile --fqbn "${fqbn}" ${boardOption} --libraries "${libs}" --build-path "${'
+              mkdir -p "${out}/package/firmware"
+              find "${out}/artifacts" -maxdepth 1 -type f \( -name "*.bin" -o -name "*.hex" -o -name "*.uf2" \) -exec cp {} "${out}/package/firmware/" \;
+              count=${'$'}(find "${out}/package/firmware" -type f | wc -l)
+              [ "${'$'}count" -gt 0 ] || { echo "No firmware artifacts produced"; exit 2; }
+              printf "%s" "{\"board\":\"${board.id}\",\"fqbn\":\"${fqbn}\"}" > "${out}/package/build-manifest.json"
+              cp "${out}/build.log" "${out}/package/build.log"
+              cd "${out}/package"
+              zip -qr "${out}/firmware.zip" firmware build-manifest.json build.log
+              rm -rf "${out}/package"
+              echo "Build succeeded. Firmware package: ${out}/firmware.zip"
+            '
+        """.trimIndent()
+        val intent = Intent(TERMUX_ACTION).apply {
+            component = ComponentName("com.termux", "com.termux.app.RunCommandService")
+            putExtra("com.termux.RUN_COMMAND_PATH", "${'$'}PREFIX/bin/bash")
+            putExtra("com.termux.RUN_COMMAND_ARGUMENTS", arrayOf("-lc", script))
+            putExtra("com.termux.RUN_COMMAND_BACKGROUND", false)
+            putExtra("com.termux.RUN_COMMAND_WORKDIR", "${'$'}HOME")
+            putExtra("com.termux.RUN_COMMAND_LABEL", "ESP Forge offline compile")
+        }
+        val callback = PendingIntent.getService(
+            activity,
+            (System.currentTimeMillis() and 0x7FFFFFFF).toInt(),
+            Intent(activity, TermuxResultService::class.java),
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_MUTABLE
+        )
+        intent.putExtra("com.termux.RUN_COMMAND_PENDING_INTENT", callback)
+        activity.startService(intent)
+        true
+    }.getOrElse { false }
+}
+
+private fun runTermuxSetup(activity: MainActivity, board: BoardOption): Boolean {
+    return runCatching {
+        val fqbn = board.fqbn
+        val core = board.core
+        val script = """
+            set -e
+            if ! command -v proot-distro >/dev/null 2>&1; then pkg update -y; pkg install -y proot-distro; fi
+            if [ ! -d "${'$'}PREFIX/var/lib/proot-distro/installed-rootfs/debian" ]; then proot-distro install debian; fi
+            proot-distro login debian -- bash -lc 'set -e
+              if ! command -v curl >/dev/null 2>&1 || ! command -v unzip >/dev/null 2>&1 || ! command -v zip >/dev/null 2>&1; then
+                apt-get update
+                apt-get install -y curl ca-certificates unzip zip python3
+              fi
+              arch="${'$'}(dpkg --print-architecture)"
+              if [ "${'$'}arch" = "arm64" ]; then asset="Linux_ARM64"; elif [ "${'$'}arch" = "amd64" ]; then asset="Linux_64bit"; else echo "Unsupported Debian architecture: ${'$'}arch"; exit 2; fi
+              if [ ! -x /usr/local/bin/arduino-cli ]; then
+                curl -fsSL "https://downloads.arduino.cc/arduino-cli/arduino-cli_1.5.1_${'$'}{asset}.tar.gz" -o /tmp/arduino-cli.tar.gz
+                tar -xzf /tmp/arduino-cli.tar.gz -C /usr/local/bin arduino-cli
+              fi
+              mkdir -p /root/.arduino15
+              cat > /root/.arduino15/arduino-cli.yaml <<EOF
+board_manager:
+  additional_urls:
+    - https://espressif.github.io/arduino-esp32/package_esp32_index.json
+    - https://arduino.esp8266.com/stable/package_esp8266com_index.json
+    - https://github.com/stm32duino/BoardManagerFiles/raw/main/package_stmicroelectronics_index.json
+    - https://github.com/openwch/board_manager_files/raw/main/package_ch32v_index.json
+EOF
+              if ! arduino-cli core list --format json | grep -Eq "\"id\"[[:space:]]*:[[:space:]]*\"${core}\""; then
+                arduino-cli core update-index
+                arduino-cli core install "${core}"
+              else
+                echo "Cached board core already installed: ${core}"
+              fi
+              echo "Local toolchain ready for ${fqbn}"
+            '
+        """.trimIndent()
+        val intent = Intent(TERMUX_ACTION).apply {
+            component = ComponentName("com.termux", "com.termux.app.RunCommandService")
+            putExtra("com.termux.RUN_COMMAND_PATH", "${'$'}PREFIX/bin/bash")
+            putExtra("com.termux.RUN_COMMAND_ARGUMENTS", arrayOf("-lc", script))
+            putExtra("com.termux.RUN_COMMAND_BACKGROUND", false)
+            putExtra("com.termux.RUN_COMMAND_WORKDIR", "${'$'}HOME")
+            putExtra("com.termux.RUN_COMMAND_LABEL", "ESP Forge toolchain setup")
+        }
+        activity.startService(intent)
+        true
+    }.getOrElse { false }
+}
+
+private fun queryDisplayName(context: Context, uri: Uri): String {
+    context.contentResolver.query(uri, arrayOf(MediaStore.MediaColumns.DISPLAY_NAME), null, null, null)?.use {
+        if (it.moveToFirst()) return it.getString(0) ?: ""
+    }
+    return uri.lastPathSegment?.substringAfterLast('/') ?: ""
+}
+
+private fun copyToSharedLibraryFolder(context: Context, source: Uri, name: String) {
+    require(Build.VERSION.SDK_INT >= 29) { "Android 10 or newer is required for shared library storage." }
+    val values = ContentValues().apply {
+        put(MediaStore.MediaColumns.DISPLAY_NAME, name)
+        put(MediaStore.MediaColumns.MIME_TYPE, "application/zip")
+        put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOCUMENTS + "/ESPForge/LibraryZips/")
+        put(MediaStore.MediaColumns.IS_PENDING, 1)
+    }
+    val uri = context.contentResolver.insert(MediaStore.Files.getContentUri("external"), values)
+        ?: throw IllegalStateException("Could not create shared library ZIP")
+    context.contentResolver.openInputStream(source)!!.use { input ->
+        context.contentResolver.openOutputStream(uri)!!.use { output -> input.copyTo(output) }
+    }
+    val ready = ContentValues().apply { put(MediaStore.MediaColumns.IS_PENDING, 0) }
+    context.contentResolver.update(uri, ready, null, null)
+}
+
+
+
+private fun searchArduinoLibraries(context: Context, query: String): List<ArduinoLibraryEntry> {
+    require(query.length in 2..80) { "Enter at least 2 characters." }
+    val cache = File(context.cacheDir, "arduino-library-index.json")
+    if (!cache.exists() || System.currentTimeMillis() - cache.lastModified() > 12L * 60L * 60L * 1000L) {
+        val connection = URL("https://downloads.arduino.cc/libraries/library_index.json").openConnection() as HttpURLConnection
+        connection.connectTimeout = 15000
+        connection.readTimeout = 45000
+        connection.setRequestProperty("User-Agent", "ESP-Forge-IDE")
+        try {
+            connection.connect()
+            require(connection.responseCode in 200..299) { "Arduino Library Manager returned HTTP ${connection.responseCode}." }
+            val temp = File(cache.parentFile, cache.name + ".tmp")
+            connection.inputStream.use { input ->
+                temp.outputStream().buffered().use { output ->
+                    val buffer = ByteArray(32 * 1024)
+                    var total = 0L
+                    while (true) {
+                        val count = input.read(buffer)
+                        if (count < 0) break
+                        total += count
+                        require(total <= 80L * 1024L * 1024L) { "Library index exceeds the 80 MiB safety limit." }
+                        output.write(buffer, 0, count)
+                    }
+                }
+            }
+            if (!temp.renameTo(cache)) {
+                temp.copyTo(cache, overwrite = true)
+                temp.delete()
+            }
+        } finally {
+            connection.disconnect()
+        }
+    }
+
+    val records = JSONObject(cache.readText(Charsets.UTF_8)).optJSONArray("libraries") ?: JSONArray()
+    val latest = linkedMapOf<String, ArduinoLibraryEntry>()
+    for (i in 0 until records.length()) {
+        val item = records.optJSONObject(i) ?: continue
+        val name = item.optString("name").trim()
+        val version = item.optString("version").trim()
+        val url = item.optString("url").trim()
+        if (name.isBlank() || version.isBlank() || !url.startsWith("https://")) continue
+        val candidate = ArduinoLibraryEntry(
+            name = name,
+            version = version,
+            sentence = item.optString("sentence"),
+            author = item.optString("author"),
+            url = url
+        )
+        val previous = latest[name]
+        if (previous == null || compareArduinoVersions(candidate.version, previous.version) > 0) {
+            latest[name] = candidate
+        }
+    }
+    return latest.values.asSequence()
+        .filter { it.name.contains(query, ignoreCase = true) || it.sentence.contains(query, ignoreCase = true) || it.author.contains(query, ignoreCase = true) }
+        .sortedWith(compareBy<ArduinoLibraryEntry> { !it.name.startsWith(query, ignoreCase = true) }.thenBy { it.name.lowercase() })
+        .take(25)
+        .toList()
+}
+
+private fun compareArduinoVersions(first: String, second: String): Int {
+    val a = Regex("\\d+").findAll(first).mapNotNull { it.value.toIntOrNull() }.toList()
+    val b = Regex("\\d+").findAll(second).mapNotNull { it.value.toIntOrNull() }.toList()
+    for (index in 0 until maxOf(a.size, b.size)) {
+        val left = a.getOrElse(index) { 0 }
+        val right = b.getOrElse(index) { 0 }
+        if (left != right) return left.compareTo(right)
+    }
+    return first.compareTo(second, ignoreCase = true)
+}
+
+private fun downloadArduinoLibrary(context: Context, entry: ArduinoLibraryEntry): File {
+    val safe = (entry.name + "-" + entry.version).replace(Regex("[^A-Za-z0-9_.-]"), "_")
+    val directory = File(context.filesDir, "library-zips").apply { mkdirs() }
+    val target = File(directory, "$safe.zip")
+    if (target.isFile && target.length() > 0L) return target
+    val connection = URL(entry.url).openConnection() as HttpURLConnection
+    connection.connectTimeout = 15000
+    connection.readTimeout = 60000
+    connection.instanceFollowRedirects = true
+    try {
+        connection.connect()
+        require(connection.responseCode in 200..299) { "Library download failed with HTTP ${connection.responseCode}." }
+        val temp = File(directory, "$safe.zip.part")
+        connection.inputStream.use { input ->
+            temp.outputStream().buffered().use { output ->
+                val buffer = ByteArray(32 * 1024)
+                var total = 0L
+                while (true) {
+                    val count = input.read(buffer)
+                    if (count < 0) break
+                    total += count
+                    require(total <= 64L * 1024L * 1024L) { "Library archive exceeds the 64 MiB safety limit." }
+                    output.write(buffer, 0, count)
+                }
+            }
+        }
+        require(temp.length() > 22L) { "Downloaded library archive is empty or invalid." }
+        if (!temp.renameTo(target)) {
+            temp.copyTo(target, overwrite = true)
+            temp.delete()
+        }
+        return target
+    } finally {
+        connection.disconnect()
+    }
+}
+
+private fun copyLibraryFileToSharedFolder(context: Context, file: File) {
+    require(Build.VERSION.SDK_INT >= 29) { "Android 10 or newer is required for local compiler library storage." }
+    val values = ContentValues().apply {
+        put(MediaStore.MediaColumns.DISPLAY_NAME, file.name)
+        put(MediaStore.MediaColumns.MIME_TYPE, "application/zip")
+        put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOCUMENTS + "/ESPForge/LibraryZips/")
+        put(MediaStore.MediaColumns.IS_PENDING, 1)
+    }
+    val uri = context.contentResolver.insert(MediaStore.Files.getContentUri("external"), values)
+        ?: throw IllegalStateException("Could not copy the library to the compiler library folder.")
+    try {
+        context.contentResolver.openOutputStream(uri)?.use { output -> file.inputStream().use { it.copyTo(output) } }
+            ?: throw IllegalStateException("Could not open the compiler library destination.")
+        val complete = ContentValues().apply { put(MediaStore.MediaColumns.IS_PENDING, 0) }
+        context.contentResolver.update(uri, complete, null, null)
+    } catch (error: Exception) {
+        context.contentResolver.delete(uri, null, null)
+        throw error
+    }
+}
+}cache/build" --output-dir "${out}/artifacts" --jobs ${effectiveJobs} . >> "${out}/build.log" 2>&1; then cat "${out}/build.log"; exit 1; fi
               mkdir -p "${out}/package/firmware"
               find "${out}/artifacts" -maxdepth 1 -type f \( -name "*.bin" -o -name "*.hex" -o -name "*.uf2" \) -exec cp {} "${out}/package/firmware/" \;
               count=${'$'}(find "${out}/package/firmware" -type f | wc -l)
