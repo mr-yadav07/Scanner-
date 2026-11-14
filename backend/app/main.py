@@ -244,11 +244,32 @@ def auto_library_names(files: Dict[str, str], index: list, log: List[str]) -> li
 
 
 def install_libraries(names: List[str], log: List[str]) -> None:
-    for name in sorted(set(names)):
-        p = run_cli(["lib", "install", name], timeout=300)
-        log.append(p.stdout)
-        if p.returncode:
-            raise RuntimeError(f"Library install failed ({name}):\n" + p.stdout[-12000:])
+    requested = sorted(set(names))
+    if not requested:
+        return
+    with CLI_LOCK:
+        installed_names = set()
+        listing = run_cli(["lib", "list", "--json"], timeout=60)
+        if listing.returncode == 0:
+            try:
+                payload = json.loads(listing.stdout or "{}")
+                entries = payload.get("installed_libraries", [])
+                for entry in entries:
+                    library = entry.get("library", entry)
+                    name = library.get("name")
+                    if name:
+                        installed_names.add(name.casefold())
+            except (json.JSONDecodeError, AttributeError, TypeError):
+                log.append("Could not parse installed-library list; verifying requested libraries individually.")
+        missing = [name for name in requested if name.casefold() not in installed_names]
+        if not missing:
+            log.append("All requested Arduino libraries are already installed; reusing local copies.")
+            return
+        for name in missing:
+            p = run_cli(["lib", "install", name], timeout=300)
+            log.append(p.stdout)
+            if p.returncode:
+                raise RuntimeError(f"Library install failed ({name}):\\n" + p.stdout[-12000:])
 
 
 @app.get("/health")
