@@ -1011,37 +1011,38 @@ private fun runOfflineCompile(activity: MainActivity, board: BoardOption, fqbn: 
             $sourceWriter
             proot-distro login --bind /storage:/storage debian -- bash -lc 'set -e
               cache="${'$'}HOME/.cache/espforge/${project}/${board.id}"
-              mkdir -p "${'$'}cache/build" '${libs}' '${out}'
-              for z in '${zipFolder}'/*.zip; do
+              mkdir -p "${'$'}cache/build" "${libs}" "${out}"
+              for z in "${zipFolder}"/*.zip; do
                 [ -f "${'$'}z" ] || continue
                 zipname="${'$'}(basename "${'$'}z")"
                 marker="${libs}/.espforge-${'$'}zipname.sha256"
-                digest="${'$'}(sha256sum "${'$'}z" | cut -d' ' -f1)"
+                digest="${'$'}(sha256sum "${'$'}z")"
+                digest="${'$'}{digest%% *}"
                 if [ -f "${'$'}marker" ] && [ "${'$'}(cat "${'$'}marker")" = "${'$'}digest" ]; then continue; fi
                 tmp="${'$'}(mktemp -d)"
                 unzip -oq "${'$'}z" -d "${'$'}tmp"
-                prop="${'$'}(find "${'$'}tmp" -name library.properties -print -quit)"
+                prop="${'$'}(find "${'$'}tmp" -name "library.properties" -print -quit)"
                 if [ -n "${'$'}prop" ]; then
                   src="${'$'}(dirname "${'$'}prop")"
                   libname="${'$'}(basename "${'$'}src")"
                   rm -rf "${libs}/${'$'}libname"
                   cp -a "${'$'}src" "${libs}/${'$'}libname"
                 fi
-                printf '%s' "${'$'}digest" > "${'$'}marker"
+                printf "%s" "${'$'}digest" > "${'$'}marker"
                 rm -rf "${'$'}tmp"
               done
-              cd '${sketch}'
-              if ! arduino-cli compile --fqbn '${fqbn}' ${boardOption} --libraries '${libs}' --build-path "${'$'}cache/build" --output-dir '${out}/artifacts' --jobs ${jobs} . > '${out}/build.log' 2>&1; then cat '${out}/build.log'; exit 1; fi
-              mkdir -p '${out}/package/firmware'
-              find '${out}/artifacts' -maxdepth 1 -type f \( -name '*.bin' -o -name '*.hex' -o -name '*.uf2' \) -exec cp {} '${out}/package/firmware/' \;
-              count=${'$'}(find '${out}/package/firmware' -type f | wc -l)
-              [ "${'$'}count" -gt 0 ] || { echo 'No firmware artifacts produced'; exit 2; }
-              printf '{"board":"${board.id}","fqbn":"${fqbn}"}' > '${out}/package/build-manifest.json'
-              cp '${out}/build.log' '${out}/package/build.log'
-              cd '${out}/package'
-              zip -qr '${out}/firmware.zip' firmware build-manifest.json build.log
-              rm -rf '${out}/package'
-              echo 'Build succeeded. Firmware package: ${out}/firmware.zip'
+              cd "${sketch}"
+              if ! arduino-cli compile --fqbn "${fqbn}" ${boardOption} --libraries "${libs}" --build-path "${'$'}cache/build" --output-dir "${out}/artifacts" --jobs ${jobs} . > "${out}/build.log" 2>&1; then cat "${out}/build.log"; exit 1; fi
+              mkdir -p "${out}/package/firmware"
+              find "${out}/artifacts" -maxdepth 1 -type f \( -name "*.bin" -o -name "*.hex" -o -name "*.uf2" \) -exec cp {} "${out}/package/firmware/" \;
+              count=${'$'}(find "${out}/package/firmware" -type f | wc -l)
+              [ "${'$'}count" -gt 0 ] || { echo "No firmware artifacts produced"; exit 2; }
+              printf "%s" "{\"board\":\"${board.id}\",\"fqbn\":\"${fqbn}\"}" > "${out}/package/build-manifest.json"
+              cp "${out}/build.log" "${out}/package/build.log"
+              cd "${out}/package"
+              zip -qr "${out}/firmware.zip" firmware build-manifest.json build.log
+              rm -rf "${out}/package"
+              echo "Build succeeded. Firmware package: ${out}/firmware.zip"
             '
         """.trimIndent()
         val intent = Intent(TERMUX_ACTION).apply {
@@ -1092,9 +1093,9 @@ board_manager:
     - https://github.com/stm32duino/BoardManagerFiles/raw/main/package_stmicroelectronics_index.json
     - https://github.com/openwch/board_manager_files/raw/main/package_ch32v_index.json
 EOF
-              if ! arduino-cli core list --format json | grep -Eq '"id"[[:space:]]*:[[:space:]]*"${core}"'; then
+              if ! arduino-cli core list --format json | grep -Eq "\"id\"[[:space:]]*:[[:space:]]*\"${core}\""; then
                 arduino-cli core update-index
-                arduino-cli core install '${core}'
+                arduino-cli core install "${core}"
               else
                 echo "Cached board core already installed: ${core}"
               fi
