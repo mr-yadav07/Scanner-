@@ -398,7 +398,7 @@ def compile_project_stream(request: CompileRequest, x_api_key: str | None = Head
 
             command = [CLI, "--config-file", str(CONFIG_FILE), "compile", "--fqbn", fqbn,
                        "--build-path", str(build_path), "--output-dir", str(outdir),
-                       "--jobs", "0", "--warnings", "default"]
+                       "--jobs", str(request.jobs), "--warnings", "default"]
             for option in DEFAULT_BOARD_OPTIONS.get(board, []):
                 command.extend(["--board-options", option])
             command.append(str(sketch))
