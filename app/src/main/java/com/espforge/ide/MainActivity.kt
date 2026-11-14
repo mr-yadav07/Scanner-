@@ -112,10 +112,11 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         val filter = IntentFilter().apply { addAction(USB_PERMISSION_ACTION); addAction(FLASH_USB_PERMISSION_ACTION) }
-        if (Build.VERSION.SDK_INT >= 33) {
-            registerReceiver(usbPermissionReceiver, filter)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            registerReceiver(usbPermissionReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
         } else {
-            @Suppress("DEPRECATION") registerReceiver(usbPermissionReceiver, filter)
+            @Suppress("DEPRECATION")
+            registerReceiver(usbPermissionReceiver, filter)
         }
         setContent {
             val themePrefs = getSharedPreferences("espforge", Context.MODE_PRIVATE)
