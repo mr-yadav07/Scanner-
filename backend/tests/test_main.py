@@ -71,3 +71,22 @@ def test_cached_sketch_preserves_unchanged_source_and_removes_deleted_files(tmp_
     sync_cached_sketch(sketch, {"main.ino": "void setup(){ }\n"})
     assert source.read_text() == "void setup(){ }\n"
     assert not (sketch / "helper.cpp").exists()
+
+
+
+def test_build_cache_paths_are_stable_and_project_scoped(tmp_path, monkeypatch):
+    import app.main as build_api
+
+    monkeypatch.setattr(build_api, "BUILD_CACHE_DIR", tmp_path)
+    first = CompileRequest(project_id="alpha", board="esp32", files={"main.ino": "void setup(){}"})
+    second = CompileRequest(project_id="beta", board="esp32", files={"main.ino": "void setup(){}"})
+
+    sketch_a, build_a, lock_a = build_api.project_cache_paths(first, "esp32", FQBN_BY_BOARD["esp32"])
+    sketch_a2, build_a2, lock_a2 = build_api.project_cache_paths(first, "esp32", FQBN_BY_BOARD["esp32"])
+    sketch_b, build_b, lock_b = build_api.project_cache_paths(second, "esp32", FQBN_BY_BOARD["esp32"])
+
+    assert (sketch_a, build_a) == (sketch_a2, build_a2)
+    assert lock_a is lock_a2
+    assert sketch_a != sketch_b
+    assert build_a != build_b
+    assert lock_a is not lock_b
