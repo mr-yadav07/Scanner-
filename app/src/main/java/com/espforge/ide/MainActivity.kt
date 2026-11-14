@@ -21,6 +21,7 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
@@ -131,6 +132,12 @@ class MainActivity : ComponentActivity() {
         setContent {
             val themePrefs = getSharedPreferences("espforge", Context.MODE_PRIVATE)
             var themeMode by remember { mutableStateOf(themePrefs.getString("themeMode", "Light") ?: "Light") }
+            val systemDark = isSystemInDarkTheme()
+            val darkActive = when (themeMode) {
+                "Dark", "AMOLED" -> true
+                "System" -> systemDark
+                else -> false
+            }
             val colors = when (themeMode) {
                 "Dark" -> darkColorScheme()
                 "AMOLED" -> darkColorScheme(
@@ -140,13 +147,15 @@ class MainActivity : ComponentActivity() {
                     surfaceVariant = Color(0xFF111111),
                     onSurface = Color(0xFFECEFF1)
                 )
+                "System" -> if (systemDark) darkColorScheme() else lightColorScheme()
                 else -> lightColorScheme()
             }
             SideEffect {
-                val dark = themeMode != "Light"
+                val dark = darkActive
                 val barColor = when (themeMode) {
                     "AMOLED" -> android.graphics.Color.BLACK
                     "Dark" -> android.graphics.Color.rgb(18, 18, 18)
+                    "System" -> if (systemDark) android.graphics.Color.rgb(18, 18, 18) else android.graphics.Color.WHITE
                     else -> android.graphics.Color.WHITE
                 }
                 window.statusBarColor = barColor
@@ -879,7 +888,7 @@ private fun ForgeHome(activity: MainActivity, themeMode: String, onThemeChange: 
                 else -> {
                     Text("Appearance", style = MaterialTheme.typography.titleMedium)
                     Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                        listOf("Light", "Dark", "AMOLED").forEach { theme ->
+                        listOf("System", "Light", "Dark", "AMOLED").forEach { theme ->
                             FilterChip(selected = themeMode == theme, onClick = { onThemeChange(theme) }, label = { Text(theme) })
                         }
                     }
