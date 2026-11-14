@@ -1404,7 +1404,6 @@ private fun copyLibraryFileToSharedFolder(context: Context, file: File) {
         throw error
     }
 }
-}cache/build" --output-dir "${out}/artifacts" --jobs ${effectiveJobs} . >> "${out}/build.log" 2>&1; then cat "${out}/build.log"; exit 1; fi
               mkdir -p "${out}/package/firmware"
               find "${out}/artifacts" -maxdepth 1 -type f \( -name "*.bin" -o -name "*.hex" -o -name "*.uf2" \) -exec cp {} "${out}/package/firmware/" \;
               count=${'$'}(find "${out}/package/firmware" -type f | wc -l)
