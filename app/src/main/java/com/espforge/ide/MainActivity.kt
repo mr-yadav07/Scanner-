@@ -997,11 +997,12 @@ private fun runOfflineCompile(activity: MainActivity, board: BoardOption, fqbn: 
         val boardOption = when (board.id) { "stm32_bluepill" -> "--board-options pnum=BLUEPILL_F103C8"; "ch32v003" -> "--board-options pnum=CH32V003F4"; else -> "" }
         val script = """
             set -e
-            mkdir -p '$sketch' '$libs' '$out' '$out/.build-cache' '$out/artifacts'
+            mkdir -p '$sketch' '$libs' '$out' '$out/artifacts'
             rm -f '$out/artifacts/'*
             $sourceWriter
             proot-distro login --bind /storage:/storage debian -- bash -lc 'set -e
-              mkdir -p '${libs}' '${out}'
+              cache="${'$'}HOME/.cache/espforge/${project}/${board.id}"
+              mkdir -p "${'$'}cache/build" '${libs}' '${out}'
               for z in '${zipFolder}'/*.zip; do
                 [ -f "${'$'}z" ] || continue
                 tmp="${'$'}(mktemp -d)"
@@ -1015,7 +1016,7 @@ private fun runOfflineCompile(activity: MainActivity, board: BoardOption, fqbn: 
                 rm -rf "${'$'}tmp"
               done
               cd '${sketch}'
-              if ! arduino-cli compile --fqbn '${fqbn}' ${boardOption} --libraries '${libs}' --build-path '${out}/.build-cache' --output-dir '${out}/artifacts' --jobs 0 . > '${out}/build.log' 2>&1; then cat '${out}/build.log'; exit 1; fi
+              if ! arduino-cli compile --fqbn '${fqbn}' ${boardOption} --libraries '${libs}' --build-path "${'$'}cache/build" --output-dir '${out}/artifacts' --jobs 0 . > '${out}/build.log' 2>&1; then cat '${out}/build.log'; exit 1; fi
               mkdir -p '${out}/package/firmware'
               find '${out}/artifacts' -maxdepth 1 -type f \( -name '*.bin' -o -name '*.hex' -o -name '*.uf2' \) -exec cp {} '${out}/package/firmware/' \;
               count=${'$'}(find '${out}/package/firmware' -type f | wc -l)
