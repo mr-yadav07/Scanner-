@@ -16,11 +16,30 @@ jobs:
         with:
           distribution: temurin
           java-version: '17'
+      - name: Install Android NDK
+        env:
+          ANDROID_HOME: /usr/local/lib/android/sdk
+          ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
+        run: |
+          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKMANAGER" --licenses >/dev/null
+          yes | "$SDKMANAGER" --install "ndk;29.0.14206865" "platforms;android-35"
+      - name: Build Android ARM64 PRoot runtime
+        env:
+          ANDROID_NDK: /usr/local/lib/android/sdk/ndk/29.0.14206865
+        run: bash tools/native/build-proot.sh arm64-v8a
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.11.1'
       - name: Build Android debug APK
         run: gradle testDebugUnitTest assembleDebug
+      - name: Verify native runtime is packaged in APK
+        run: |
+          set -euo pipefail
+          apk="$(find app/build/outputs/apk/debug -maxdepth 1 -name '*.apk' -print -quit)"
+          test -n "$apk"
+          unzip -l "$apk" | grep -F 'lib/arm64-v8a/libproot.so'
+          unzip -l "$apk" | grep -F 'lib/arm64-v8a/libproot-loader.so'
       - uses: actions/upload-artifact@v4
         with:
           name: esp-forge-debug-apk

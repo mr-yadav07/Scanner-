@@ -1,0 +1,492 @@
+package com.espforge.ide
+
+import android.content.Context
+import org.apache.commons.compress.archivers.tar.TarArchiveInputStream
+import org.apache.commons.compress.compressors.gzip.GzipCompressorInputStream
+import org.json.JSONObject
+import java.io.BufferedInputStream
+import java.io.ByteArrayOutputStream
+import java.io.File
+import java.io.FileInputStream
+import java.io.FileOutputStream
+import java.net.HttpURLConnection
+import java.net.URL
+import java.nio.file.Files
+import java.nio.file.Paths
+import java.security.MessageDigest
+import java.util.concurrent.TimeUnit
+import java.util.zip.ZipInputStream
+import java.util.zip.ZipOutputStream
+
+/**
+ * App-managed local Arduino compiler for ARM64 Android.
+ *
+ * PRoot and its loader are Bionic executables packaged in jniLibs. The Linux
+ * ARM64 Arduino CLI and board compilers execute inside a private Debian rootfs.
+ * The user does not install or launch Termux.
+ */
+internal class NativeToolchainManager(context: Context) {
+    private val app = context.applicationContext
+    private val runtimeDir = File(app.filesDir, "espforge-runtime")
+    private val rootfs = File(runtimeDir, "rootfs")
+    private val rootfsMarker = File(runtimeDir, "rootfs.ready")
+    private val workspace = File(runtimeDir, "workspace")
+    private val cacheDir = File(app.cacheDir, "espforge-runtime")
+    private val proot = File(app.applicationInfo.nativeLibraryDir, "libproot.so")
+    private val loader = File(app.applicationInfo.nativeLibraryDir, "libproot-loader.so")
+
+    @Volatile private var activeProcess: Process? = null
+
+    data class CompileResult(val archive: ByteArray, val log: String)
+    private data class RunResult(val exitCode: Int, val output: String, val timedOut: Boolean)
+
+    fun cancel() {
+        activeProcess?.destroyForcibly()
+    }
+
+    fun supportsLocalBoard(boardId: String): Boolean =
+        boardId in setOf("arduino_uno", "arduino_nano", "esp8266", "esp32", "esp32_s3", "stm32_bluepill")
+
+    fun prepareBoard(boardId: String, core: String, fqbn: String, onLine: (String) -> Unit = {}) {
+        require(supportsLocalBoard(boardId)) {
+            "The official WCH package currently has no Linux ARM64 compiler. Use Remote Arduino CLI for CH32V003."
+        }
+        ensureNativeRuntime()
+        ensureWorkspace()
+        writeResolverFiles()
+        val cliReady = runGuest(
+            listOf("/bin/bash", "-lc", "command -v arduino-cli >/dev/null 2>&1"),
+            timeoutMs = 30_000
+        )
+        if (cliReady.exitCode != 0) {
+            onLine("Installing Debian runtime dependencies and Arduino CLI…")
+            runChecked(
+                listOf("/bin/bash", "-lc",
+                    "set -e; export DEBIAN_FRONTEND=noninteractive; apt-get update; " +
+                    "apt-get install -y ca-certificates curl python3 unzip zip xz-utils; " +
+                    "curl --retry 3 --retry-all-errors -fsSL " +
+                    "https://downloads.arduino.cc/arduino-cli/arduino-cli_1.6.0_Linux_ARM64.tar.gz " +
+                    "-o /tmp/arduino-cli.tar.gz; " +
+                    "tar -xzf /tmp/arduino-cli.tar.gz -C /usr/local/bin arduino-cli; " +
+                    "chmod 755 /usr/local/bin/arduino-cli; rm -f /tmp/arduino-cli.tar.gz"
+                ), 30 * 60_000L, onLine
+            )
+        }
+        configureArduinoCli()
+        val installed = runGuest(
+            listOf("/bin/bash", "-lc",
+                "arduino-cli core list --format json | grep -Eq '\"id\"[[:space:]]*:[[:space:]]*\"$core\"'"),
+            timeoutMs = 60_000
+        )
+        if (installed.exitCode != 0) {
+            onLine("Updating board indexes for $fqbn…")
+            runChecked(listOf("arduino-cli", "core", "update-index"), 10 * 60_000L, onLine)
+            onLine("Installing $core (first setup downloads vendor toolchains)…")
+            runChecked(listOf("arduino-cli", "core", "install", core), 45 * 60_000L, onLine)
+        } else {
+            onLine("Cached board core found: $core")
+        }
+        onLine("Local toolchain ready: $fqbn")
+    }
+
+    fun compile(
+        boardId: String,
+        core: String,
+        fqbn: String,
+        boardOption: String?,
+        project: String,
+        files: Map<String, String>,
+        libraryZips: List<File>,
+        jobs: Int,
+        onLine: (String) -> Unit = {}
+    ): CompileResult {
+        require(supportsLocalBoard(boardId)) {
+            "This board has no supported Linux ARM64 compiler package. Use Remote Arduino CLI."
+        }
+        require(project.matches(Regex("[A-Za-z0-9_-]{1,48}"))) { "Invalid project name." }
+        require(files.isNotEmpty() && files.size <= 40 && files.containsKey("main.ino")) {
+            "Project must contain main.ino and no more than 40 source files."
+        }
+        require(files.keys.all { it.matches(Regex("[A-Za-z0-9_.-]{1,64}\\.(ino|cpp|c|h|hpp)")) }) {
+            "Project contains an invalid source filename."
+        }
+        require(files.values.sumOf { it.toByteArray(Charsets.UTF_8).size } <= 350_000) {
+            "Project source exceeds 350 KB."
+        }
+
+        ensureNativeRuntime()
+        ensureWorkspace()
+        prepareBoard(boardId, core, fqbn, onLine)
+
+        val boardCache = fqbn.replace(':', '_')
+        val sketchDir = File(workspace, "Projects/$project")
+        val libDir = File(workspace, "InstalledLibraries")
+        val buildDir = File(workspace, "BuildCache/$project/$boardCache")
+        val outputDir = File(workspace, "Builds/$project/artifacts")
+        sketchDir.mkdirs()
+        libDir.mkdirs()
+        buildDir.mkdirs()
+        outputDir.deleteRecursively()
+        outputDir.mkdirs()
+
+        // Preserve unchanged timestamps so Arduino's build cache can reuse objects.
+        val expectedNames = files.keys
+        sketchDir.listFiles()?.filter {
+            it.isFile && it.extension.lowercase() in setOf("ino", "cpp", "c", "h", "hpp")
+        }?.filter { it.name !in expectedNames }?.forEach { it.delete() }
+        for ((name, source) in files) {
+            val target = File(sketchDir, name)
+            if (!target.isFile || target.readText(Charsets.UTF_8) != source) {
+                target.parentFile?.mkdirs()
+                target.writeText(source, Charsets.UTF_8)
+            }
+        }
+        installLocalLibraries(libraryZips, libDir, onLine)
+
+        val args = mutableListOf(
+            "arduino-cli", "compile",
+            "--fqbn", fqbn,
+            "--libraries", "/workspace/InstalledLibraries",
+            "--build-path", "/workspace/BuildCache/$project/$boardCache",
+            "--output-dir", "/workspace/Builds/$project/artifacts",
+            "--jobs", jobs.coerceIn(1, 4).toString(),
+            "--warnings", "all"
+        )
+        if (!boardOption.isNullOrBlank()) {
+            args += "--board-options"
+            args += boardOption
+        }
+        args += "/workspace/Projects/$project"
+
+        onLine("Compiling $project for $fqbn with " + jobs.coerceIn(1, 4) + " worker(s)…")
+        val result = runGuest(args, timeoutMs = 30 * 60_000L, onLine = onLine)
+        if (result.timedOut) throw IllegalStateException("Local compilation timed out after 30 minutes.")
+        if (result.exitCode != 0) {
+            throw IllegalStateException("Local compilation failed (exit " + result.exitCode + ").\n" + result.output.takeLast(18000))
+        }
+
+        val artifacts = outputDir.listFiles()?.filter {
+            it.isFile && it.extension.lowercase() in setOf("bin", "hex")
+        }.orEmpty()
+        require(artifacts.isNotEmpty()) {
+            "Compiler exited successfully but did not produce a supported .bin or .hex firmware file."
+        }
+
+        val manifest = JSONObject()
+            .put("board", boardId)
+            .put("fqbn", fqbn)
+            .put("project", project)
+            .put("runtime", "espforge-app-managed-arm64")
+            .put("artifacts", artifacts.map {
+                JSONObject().put("name", it.name).put("size", it.length())
+            })
+
+        val zipBytes = ByteArrayOutputStream().use { buffer ->
+            ZipOutputStream(buffer).use { zip ->
+                for (artifact in artifacts) {
+                    zip.putNextEntry(java.util.zip.ZipEntry("firmware/" + artifact.name))
+                    FileInputStream(artifact).use { it.copyTo(zip) }
+                    zip.closeEntry()
+                }
+                zip.putNextEntry(java.util.zip.ZipEntry("build-manifest.json"))
+                zip.write(manifest.toString(2).toByteArray(Charsets.UTF_8))
+                zip.closeEntry()
+                zip.putNextEntry(java.util.zip.ZipEntry("build.log"))
+                zip.write(result.output.toByteArray(Charsets.UTF_8))
+                zip.closeEntry()
+            }
+            buffer.toByteArray()
+        }
+        File(workspace, "Builds/$project/firmware.zip").writeBytes(zipBytes)
+        onLine("Local build succeeded. " + artifacts.size + " firmware artifact(s) are ready.")
+        return CompileResult(zipBytes, result.output)
+    }
+
+    private fun ensureNativeRuntime() {
+        require(proot.isFile && loader.isFile) {
+            "The Android native PRoot runtime is missing from this APK. Rebuild with tools/native/build-proot.sh."
+        }
+        if (rootfsMarker.isFile && File(rootfs, "usr/bin/dpkg").exists()) return
+
+        runtimeDir.mkdirs()
+        cacheDir.mkdirs()
+        val manifestText = URL(ROOTFS_MANIFEST_URL).openConnection().apply {
+            connectTimeout = 20_000
+            readTimeout = 60_000
+        }.getInputStream().bufferedReader(Charsets.UTF_8).use { it.readText() }
+        val manifest = JSONObject(manifestText)
+        val version = manifest.getString("version")
+        val asset = manifest.getString("asset")
+        val expectedSha = manifest.getString("sha256").lowercase()
+        val expectedSize = manifest.getLong("size")
+        require(version == ROOTFS_VERSION && asset == ROOTFS_ARCHIVE_NAME) {
+            "The published Android runtime manifest is invalid."
+        }
+        require(expectedSize in 1..900_000_000L && expectedSha.matches(Regex("[a-f0-9]{64}"))) {
+            "The published Android runtime archive metadata is invalid."
+        }
+
+        val archive = File(cacheDir, ROOTFS_ARCHIVE_NAME)
+        if (!archive.isFile || archive.length() != expectedSize || sha256(archive) != expectedSha) {
+            archive.delete()
+            val partial = File(cacheDir, "$ROOTFS_ARCHIVE_NAME.part")
+            partial.delete()
+            val connection = URL(ROOTFS_RELEASE_BASE + "/" + asset).openConnection() as HttpURLConnection
+            connection.connectTimeout = 30_000
+            connection.readTimeout = 300_000
+            connection.instanceFollowRedirects = true
+            connection.connect()
+            require(connection.responseCode in 200..299) {
+                "Unable to download local runtime (HTTP " + connection.responseCode + ")."
+            }
+            connection.inputStream.use { input ->
+                FileOutputStream(partial).use { output ->
+                    val buffer = ByteArray(64 * 1024)
+                    var total = 0L
+                    while (true) {
+                        val count = input.read(buffer)
+                        if (count < 0) break
+                        total += count
+                        require(total <= expectedSize) { "Runtime archive exceeds published size." }
+                        output.write(buffer, 0, count)
+                    }
+                    output.fd.sync()
+                }
+            }
+            connection.disconnect()
+            require(partial.length() == expectedSize && sha256(partial) == expectedSha) {
+                "Local runtime download failed its SHA-256 integrity check."
+            }
+            check(partial.renameTo(archive)) { "Unable to finalize local runtime archive." }
+        }
+
+        val staging = File(runtimeDir, "rootfs.extracting")
+        staging.deleteRecursively()
+        staging.mkdirs()
+        extractRootfs(archive, staging)
+        require(File(staging, "bin/sh").exists()) { "Downloaded runtime does not contain /bin/sh." }
+        rootfs.deleteRecursively()
+        check(staging.renameTo(rootfs)) { "Unable to install Debian runtime into app storage." }
+        rootfsMarker.writeText(version + "\n" + expectedSha + "\n", Charsets.UTF_8)
+    }
+
+    private fun extractRootfs(archive: File, destination: File) {
+        val base = destination.toPath().toAbsolutePath().normalize()
+        var entries = 0
+        val hardLinks = mutableListOf<Pair<java.nio.file.Path, java.nio.file.Path>>()
+        TarArchiveInputStream(
+            GzipCompressorInputStream(BufferedInputStream(FileInputStream(archive)))
+        ).use { tar ->
+            var entry = tar.nextTarEntry
+            while (entry != null) {
+                val name = entry.name.removePrefix("./").trimStart('/')
+                if (name.isNotBlank() && name != ".") {
+                    val target = base.resolve(name).normalize()
+                    require(target.startsWith(base)) { "Unsafe path in runtime archive." }
+                    if (entry.isDirectory) {
+                        target.toFile().mkdirs()
+                    } else if (entry.isSymbolicLink) {
+                        target.parent?.toFile()?.mkdirs()
+                        runCatching { Files.deleteIfExists(target) }
+                        Files.createSymbolicLink(target, Paths.get(entry.linkName))
+                    } else if (entry.isLink) {
+                        val link = base.resolve(entry.linkName.removePrefix("./").trimStart('/')).normalize()
+                        require(link.startsWith(base)) { "Unsafe hard link in runtime archive." }
+                        target.parent?.toFile()?.mkdirs()
+                        hardLinks += target to link
+                    } else if (entry.isFile) {
+                        target.parent?.toFile()?.mkdirs()
+                        FileOutputStream(target.toFile()).use { output -> tar.copyTo(output, 64 * 1024) }
+                        val mode = entry.mode
+                        target.toFile().setExecutable((mode and 0x49) != 0, false)
+                        target.toFile().setReadable((mode and 0x124) != 0, false)
+                        target.toFile().setWritable((mode and 0x92) != 0, false)
+                    }
+                }
+                entries++
+                if (entries % 1500 == 0) android.util.Log.i(TAG, "Extracted " + entries + " runtime entries")
+                entry = tar.nextTarEntry
+            }
+        }
+        for ((target, link) in hardLinks) {
+            if (Files.exists(link)) Files.copy(link, target)
+        }
+    }
+
+    private fun writeResolverFiles() {
+        val etc = File(rootfs, "etc")
+        etc.mkdirs()
+        val resolver = File(etc, "resolv.conf")
+        runCatching { Files.deleteIfExists(resolver.toPath()) }
+        resolver.writeText("nameserver 1.1.1.1\nnameserver 9.9.9.9\n", Charsets.UTF_8)
+        File(etc, "hosts").writeText(
+            "127.0.0.1 localhost\n::1 localhost ip6-localhost ip6-loopback\n", Charsets.UTF_8
+        )
+        for (path in listOf("dev", "proc", "sys", "tmp", "workspace", "root")) {
+            File(rootfs, path).mkdirs()
+        }
+        File(rootfs, ".l2s").mkdirs()
+        workspace.mkdirs()
+        File(cacheDir, "proot-tmp").mkdirs()
+    }
+
+    private fun ensureWorkspace() {
+        for (path in listOf("Projects", "InstalledLibraries", "LibraryZips", "BuildCache", "Builds", "Downloads")) {
+            File(workspace, path).mkdirs()
+        }
+    }
+
+    private fun configureArduinoCli() {
+        val config = File(rootfs, "root/.arduino15/arduino-cli.yaml")
+        config.parentFile?.mkdirs()
+        val contents = """
+            board_manager:
+              additional_urls:
+                - $ESP32_INDEX
+                - $ESP8266_INDEX
+                - $STM32_INDEX
+            directories:
+              data: /root/.arduino15
+              downloads: /root/.arduino15/staging
+              user: /root/Arduino
+        """.trimIndent() + "\n"
+        if (!config.isFile || config.readText(Charsets.UTF_8) != contents) {
+            config.writeText(contents, Charsets.UTF_8)
+        }
+    }
+
+    private fun installLocalLibraries(zips: List<File>, libraryDirectory: File, onLine: (String) -> Unit) {
+        val markerDir = File(libraryDirectory, ".espforge-cache")
+        markerDir.mkdirs()
+        for (zip in zips.filter { it.isFile && it.extension.equals("zip", true) }) {
+            val digest = sha256(zip)
+            val marker = File(markerDir, zip.name + ".sha256")
+            if (marker.isFile && marker.readText(Charsets.UTF_8) == digest) continue
+            onLine("Installing local library " + zip.name + "…")
+            val temp = File(workspace, "Downloads/library-" + digest.take(16))
+            temp.deleteRecursively()
+            temp.mkdirs()
+            ZipInputStream(BufferedInputStream(FileInputStream(zip))).use { input ->
+                var entry = input.nextEntry
+                while (entry != null) {
+                    val safeName = entry.name.replace('\\', '/').removePrefix("./")
+                    val base = temp.toPath().toAbsolutePath().normalize()
+                    val target = base.resolve(safeName).normalize()
+                    require(target.startsWith(base)) { "Unsafe path in library ZIP " + zip.name + "." }
+                    if (entry.isDirectory) target.toFile().mkdirs()
+                    else {
+                        target.parent?.toFile()?.mkdirs()
+                        FileOutputStream(target.toFile()).use { output -> input.copyTo(output, 32 * 1024) }
+                    }
+                    input.closeEntry()
+                    entry = input.nextEntry
+                }
+            }
+            val properties = temp.walkTopDown().firstOrNull { it.isFile && it.name == "library.properties" }
+            if (properties != null) {
+                val source = properties.parentFile
+                val destination = File(libraryDirectory, source.name)
+                destination.deleteRecursively()
+                source.copyRecursively(destination, overwrite = true)
+                marker.writeText(digest, Charsets.UTF_8)
+            } else {
+                onLine("Skipped " + zip.name + ": library.properties was not found.")
+            }
+            temp.deleteRecursively()
+        }
+    }
+
+    private fun runChecked(args: List<String>, timeoutMs: Long, onLine: (String) -> Unit = {}) {
+        val result = runGuest(args, timeoutMs, onLine)
+        if (result.timedOut) throw IllegalStateException("Local toolchain operation timed out.")
+        if (result.exitCode != 0) {
+            throw IllegalStateException(
+                "Local toolchain command failed (exit " + result.exitCode + ").\n" +
+                    result.output.takeLast(16000)
+            )
+        }
+    }
+
+    private fun runGuest(
+        guestArgs: List<String>,
+        timeoutMs: Long,
+        onLine: (String) -> Unit = {}
+    ): RunResult {
+        val command = mutableListOf(
+            proot.absolutePath,
+            "--kill-on-exit", "--link2symlink", "--sysvipc", "-L", "-0",
+            "--rootfs=" + rootfs.canonicalPath,
+            "--cwd=/root",
+            "--bind=/dev:/dev",
+            "--bind=/proc:/proc",
+            "--bind=/sys:/sys",
+            "--bind=/dev/urandom:/dev/random",
+            "--bind=/proc/self/fd:/dev/fd",
+            "--bind=" + workspace.canonicalPath + ":/workspace",
+            "/usr/bin/env", "-i",
+            "HOME=/root", "USER=root", "LOGNAME=root", "SHELL=/bin/bash",
+            "TERM=xterm-256color", "LANG=C.UTF-8",
+            "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            "TMPDIR=/tmp"
+        )
+        command += guestArgs
+        val builder = ProcessBuilder(command).redirectErrorStream(true)
+        builder.environment().apply {
+            clear()
+            put("PROOT_LOADER", loader.absolutePath)
+            put("PROOT_TMP_DIR", File(cacheDir, "proot-tmp").absolutePath)
+            put("PROOT_L2S_DIR", File(rootfs, ".l2s").absolutePath)
+            put("PATH", "/system/bin")
+            put("ANDROID_ROOT", "/system")
+            put("ANDROID_DATA", "/data")
+        }
+        val process = builder.start()
+        activeProcess = process
+        val output = StringBuilder()
+        val reader = Thread {
+            process.inputStream.bufferedReader(Charsets.UTF_8).useLines { lines ->
+                for (line in lines) {
+                    synchronized(output) {
+                        output.append(line).append('\n')
+                        if (output.length > MAX_LOG_CHARS) output.delete(0, output.length - MAX_LOG_CHARS)
+                    }
+                    onLine(line)
+                }
+            }
+        }.apply { isDaemon = true; start() }
+
+        val finished = process.waitFor(timeoutMs, TimeUnit.MILLISECONDS)
+        if (!finished) process.destroyForcibly()
+        reader.join(5_000)
+        activeProcess = null
+        val code = if (finished) process.exitValue() else -1
+        return RunResult(code, synchronized(output) { output.toString() }, !finished)
+    }
+
+    private fun sha256(file: File): String {
+        val digest = MessageDigest.getInstance("SHA-256")
+        FileInputStream(file).use { input ->
+            val buffer = ByteArray(64 * 1024)
+            while (true) {
+                val count = input.read(buffer)
+                if (count < 0) break
+                digest.update(buffer, 0, count)
+            }
+        }
+        return digest.digest().joinToString("") { "%02x".format(it) }
+    }
+
+    companion object {
+        private const val TAG = "EspForgeNativeRuntime"
+        private const val MAX_LOG_CHARS = 160_000
+        private const val ROOTFS_VERSION = "1"
+        private const val ROOTFS_ARCHIVE_NAME = "debian-arm64-rootfs.tar.gz"
+        private const val ROOTFS_RELEASE_BASE =
+            "https://github.com/mr-yadav07/Scanner-/releases/download/forge-runtime-v1"
+        private const val ROOTFS_MANIFEST_URL = "$ROOTFS_RELEASE_BASE/runtime-manifest.json"
+        private const val ESP32_INDEX = "https://espressif.github.io/arduino-esp32/package_esp32_index.json"
+        private const val ESP8266_INDEX = "https://arduino.esp8266.com/stable/package_esp8266com_index.json"
+        private const val STM32_INDEX =
+            "https://github.com/stm32duino/BoardManagerFiles/raw/main/package_stmicroelectronics_index.json"
+    }
+}

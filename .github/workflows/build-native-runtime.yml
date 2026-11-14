@@ -1,0 +1,54 @@
+name: Build Android ARM64 compiler runtime
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [feat/in-app-android-runtime]
+    paths:
+      - "tools/native/rootfs.Dockerfile"
+      - ".github/workflows/build-native-runtime.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  rootfs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - name: Build minimal Debian ARM64 root filesystem
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          docker buildx build \
+            --platform linux/arm64 \
+            --file tools/native/rootfs.Dockerfile \
+            --tag espforge-rootfs:arm64 \
+            --output type=docker,dest=/tmp/espforge-rootfs-image.tar .
+          docker load --input /tmp/espforge-rootfs-image.tar
+          cid="$(docker create espforge-rootfs:arm64)"
+          docker export "$cid" | gzip -1 > "dist/debian-arm64-rootfs.tar.gz"
+          docker rm "$cid"
+          sha="$(sha256sum dist/debian-arm64-rootfs.tar.gz | cut -d' ' -f1)"
+          size="$(stat -c '%s' dist/debian-arm64-rootfs.tar.gz)"
+          jq -n \
+            --arg version "1" \
+            --arg asset "debian-arm64-rootfs.tar.gz" \
+            --arg sha256 "$sha" \
+            --argjson size "$size" \
+            '{version:$version,asset:$asset,sha256:$sha256,size:$size}' \
+            > dist/runtime-manifest.json
+          cat dist/runtime-manifest.json
+      - name: Publish versioned runtime assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: forge-runtime-v1
+          target_commitish: feat/in-app-android-runtime
+          name: ESP Forge Android ARM64 Runtime v1
+          prerelease: true
+          overwrite_files: true
+          files: |
+            dist/debian-arm64-rootfs.tar.gz
+            dist/runtime-manifest.json
